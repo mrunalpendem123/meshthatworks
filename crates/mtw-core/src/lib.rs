@@ -4,3 +4,6 @@
 //! across the home mesh. Uses iroh for transport and identity.
 
 pub mod echo;
+pub mod identity;
+pub mod pair;
+pub mod peers;

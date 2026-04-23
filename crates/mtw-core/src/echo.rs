@@ -1,19 +1,19 @@
 //! Diagnostic iroh echo — Milestone 1 transport sanity check.
 //!
-//! `listen` opens an iroh endpoint, advertises the echo ALPN, and copies any
-//! bytes received on a bidirectional stream straight back. `dial` connects
-//! to a printed endpoint id, sends a message, and prints the reply.
+//! `listen` opens an iroh endpoint under the device's persistent identity,
+//! advertises the echo ALPN, and copies any bytes received on a bidirectional
+//! stream straight back. `dial` connects to a printed endpoint id, sends a
+//! message, and prints the reply.
 
 use anyhow::Context;
-use iroh::{
-    Endpoint, EndpointAddr, EndpointId,
-    endpoint::presets,
-};
+use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 
 pub const ECHO_ALPN: &[u8] = b"mtw/echo/0";
 
 pub async fn listen() -> anyhow::Result<()> {
+    let secret = crate::identity::load_or_create()?;
     let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret)
         .alpns(vec![ECHO_ALPN.to_vec()])
         .bind()
         .await
@@ -62,7 +62,10 @@ pub async fn dial(target: &str, message: &str) -> anyhow::Result<()> {
         .with_context(|| format!("parse endpoint id from {target:?}"))?;
     let addr = EndpointAddr::from(id);
 
-    let endpoint = Endpoint::bind(presets::N0)
+    let secret = crate::identity::load_or_create()?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .bind()
         .await
         .context("bind client endpoint")?;
 

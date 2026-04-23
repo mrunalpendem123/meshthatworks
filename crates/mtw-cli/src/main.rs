@@ -16,6 +16,15 @@ enum Command {
     /// Transport diagnostics — iroh echo listen/dial.
     #[command(subcommand)]
     Echo(EchoCmd),
+    /// Print an invite code and wait for a peer to join.
+    Pair,
+    /// Join an existing mesh using an invite code.
+    Join {
+        /// Invite string printed by `mtw pair` on the other device.
+        invite: String,
+    },
+    /// List peers saved at ~/.mtw/peers.json.
+    Peers,
 }
 
 #[derive(Subcommand)]
@@ -48,5 +57,27 @@ async fn main() -> anyhow::Result<()> {
             let joined = message.join(" ");
             mtw_core::echo::dial(&target, &joined).await
         }
+        Command::Pair => {
+            let secret = mtw_core::identity::load_or_create()?;
+            mtw_core::pair::pair(secret).await
+        }
+        Command::Join { invite } => {
+            let secret = mtw_core::identity::load_or_create()?;
+            mtw_core::pair::join(secret, &invite).await
+        }
+        Command::Peers => peers_cmd(),
     }
+}
+
+fn peers_cmd() -> anyhow::Result<()> {
+    let list = mtw_core::peers::load()?;
+    if list.peers.is_empty() {
+        println!("no peers paired yet. run `mtw pair` on one device and `mtw join <invite>` on the other.");
+        return Ok(());
+    }
+    println!("{} peer(s) in ~/.mtw/peers.json:", list.peers.len());
+    for peer in &list.peers {
+        println!("  {}  (paired at unix {})", peer.id, peer.paired_at);
+    }
+    Ok(())
 }
