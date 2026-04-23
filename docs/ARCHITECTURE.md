@@ -82,18 +82,19 @@ User points Claude Code at `http://localhost:9337`. Claude Code sends a prompt. 
   - Repo: https://github.com/n0-computer/iroh/tree/main/iroh-gossip
 
 ### 4.2 Inference engine (per-node)
-- **SharpAI/mlx** — MLX fork that carries the SSD streaming primitive. This is the fork we actually build against.
-  - Repo: https://github.com/SharpAI/mlx
-  - Key files: `mlx/backend/metal/ssd_streamer.{mm,h}`, `mlx/core/moe_stream_op.{cpp,h}`, `mlx/backend/metal/kernels/{fence,moe_stream}.metal`
-  - Reference commit: `9a9c214` ("feat: custom ssd-streaming kernels and custom MLX I/O fast loaders")
-  - License: MIT
-  - See `docs/ENGINE_RESEARCH.md` for a file:line walkthrough.
-- **SwiftLM** — Swift wrapper that sits on top of MLX. Not on the critical path for v1; we may or may not consume any of it depending on whether we need its Swift-side tokenization/weight-loading helpers.
+
+Per-node inference is **SwiftLM** running locally as an OpenAI-compatible HTTP server. We don't re-implement streaming; we run SharpAI's engine and talk to it from `mtw-core` over `localhost`.
+
+- **SwiftLM** — *primary inference runtime*. Swift-based engine built on `mlx-swift` + `mlx-swift-lm`, with full SSD expert streaming integrated (benchmarked at 10.8 tok/s on 26B MoE in 22 GB RAM per the repo README). Exposes `/v1/chat/completions` with streaming. Enable streaming with `--stream-experts`.
   - Repo: https://github.com/SharpAI/SwiftLM
   - License: MIT
-  - Author: Eric Lake (SharpAI)
-- **SharpAI/mlx-c** — C bindings for MLX. Candidate for the `mtw-engine` FFI layer.
-  - Repo: https://github.com/SharpAI/mlx-c
+  - Author: Eric Lake (SharpAI, `@ericjlake`)
+  - CLI flags relevant to us: `--model`, `--port`, `--stream-experts`, `--stream-workers` (PAPPS thread pool)
+- **mlx-swift** — Swift bindings + internal MLX C++ source, built as a submodule of SwiftLM. This is where `libmlx.a` (with `streamed_gather_mm`, `SSDStreamer`, `streamed_moe_gemm`) actually gets compiled in the SwiftLM build pipeline. Our separately-patched `SharpAI/mlx` clone at `~/Desktop/meshthatworks-deps/mlx/` was useful to verify the primitive exists; the production build path is via `./build.sh` inside SwiftLM, not via our external clone.
+- **mlx-swift-lm** — Swift model library (SharpAI fork, with GPU/CPU layer partitioning). Defines the MoE model classes that actually *call* `streamed_gather_mm` during forward passes when streaming is enabled. This is the caller we thought was missing; it's in SwiftLM's world, not ours to write.
+- **SharpAI/mlx-c** — C bindings for MLX. Only relevant if we later build a Rust FFI path alongside the SwiftLM HTTP path.
+
+**How we consume it**: `mtw-engine` will ship a `SwiftLMEngine` struct implementing `InferenceEngine`, whose `run_layer`/`generate` methods send HTTP requests to a local SwiftLM server (spawned as a child process). The `Box<dyn InferenceEngine>` abstraction we built earlier lets us swap `MockEngine` → `SwiftLMEngine` at one call site in the CLI.
 
 ### 4.3 Mesh coordination reference
 - **Mesh-LLM** — reference for iroh usage patterns and agent integration
@@ -129,13 +130,18 @@ User points Claude Code at `http://localhost:9337`. Claude Code sends a prompt. 
 
 ### 5.1 Per-node SSD streaming inside a mesh
 
-Upstream reality (see `docs/ENGINE_RESEARCH.md`): SharpAI/mlx already ships the SSD→GPU primitive (pinned `MTLBuffer` + `pread` + a Metal 4-bit GEMM kernel), but the hot path is **synchronous and per-forward-pass** — no expert-level cache, no prefetch. The `io_queue_` and `MTL::SharedEvent shared_event_` hooks are constructed but inert.
+**Upstream reality (correcting an earlier misread):** SharpAI has already shipped per-node SSD streaming end-to-end in SwiftLM. Their stack includes cross-projection batching, concurrent `pread` with QD=24, an asyncEval pipeline, and runtime top-k expert selection. Published numbers: 10× speedup (0.58 → 5.91 tok/s) on 122B models with ~10 GB resident; 10.8 tok/s on a 26B MoE in 22 GB. This is the best-in-class single-node implementation today. **We use it, we do not reimplement it.**
 
-What we build:
-- **Expert-aware LRU cache** keyed by `active_expert` id, living in `mtw-engine` / `mtw-cache`. Deferred deallocation past end of forward pass, so hot experts stay resident.
-- **Async prefetch path**: reactivate the dormant `io_queue_` for non-blocking `load_async`, wire `shared_event_` into a Metal command buffer wait so compute overlaps with next-expert load.
-- **Allocator ceiling tuning** via `MetalAllocator::set_memory_limit()` for the 4–8GB unified-memory budget. No `MLX` source changes needed for this — caller-side init only.
-- **4–8GB budget constants** live in our cache layer, not upstream; MLX has no such knob today.
+What we build *on top*:
+- **Mesh layer** that lets two or more devices each run SwiftLM locally, with layer-partitioned inference: Node A runs its assigned transformer layers, passes activations to Node B over iroh, B runs its layers and returns the output. The per-node SSD streaming inside each SwiftLM process is *already given*.
+- **`mtw-engine`'s `SwiftLMEngine`**: a Rust HTTP client that spawns SwiftLM as a child process and drives it through its OpenAI-compatible API. Implements the `InferenceEngine` trait alongside `MockEngine`.
+- **Process lifecycle + health**: `mtw serve` supervises a local SwiftLM child, restarts on crash, surfaces readiness through `mtw/health/0` (extending what we already built).
+- **Shard assignment** (spec §5.3): which peer holds which layers, informed by each peer's local SwiftLM streaming-hit-rate telemetry (reported back through our mesh).
+
+What we explicitly do **not** build anymore (SharpAI already did):
+- Expert-level LRU / hot-cache (SwiftLM has runtime top-k selection)
+- Async prefetch (SwiftLM ships it already, the QD=24 concurrent pread pipeline)
+- `MetalAllocator` ceiling tuning (SwiftLM exposes it through `--stream-budget`)
 
 ### 5.2 Usage-adaptive expert caching
 - Per-node instrumentation: record which experts fire on user's actual prompts

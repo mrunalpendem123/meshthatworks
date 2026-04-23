@@ -6,6 +6,8 @@
 
 ---
 
+> **2026-04-23 correction.** The original section 0 of this note claimed "no end-to-end test or benchmark exercises the streamer" (point 4) and treated expert-level cache + async prefetch as new work we'd have to build from scratch. **That framing was wrong.** SharpAI's *SwiftLM* — a separate Swift-based inference runtime in the `SwiftLM` repo, not the `mlx` repo — is the caller of `streamed_gather_mm`. It ships concurrent `pread` with QD=24, runtime top-k expert selection, and an asyncEval pipeline that fuses compute with next-expert load. Published benchmarks: 10.8 tok/s on a 26B MoE in 22 GB RAM; 10× speedup on 122B models. The integration we assumed was missing *exists*, just inside SwiftLM, not inside the MLX repo we initially looked at. Points 2 and 3 below (no cache, no prefetch) were correct observations about `SharpAI/mlx` in isolation, but wrong takeaways about the overall SharpAI stack. The project's novel work is therefore the *mesh* layer on top of SwiftLM, not reimplementing SwiftLM's streaming.
+
 ## 0. Key findings that diverge from ARCHITECTURE.md
 
 Six things the spec describes that don't match the code on disk. Flagging up front so the milestone plan can adjust.
