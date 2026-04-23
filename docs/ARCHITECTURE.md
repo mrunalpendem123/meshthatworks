@@ -82,13 +82,18 @@ User points Claude Code at `http://localhost:9337`. Claude Code sends a prompt. 
   - Repo: https://github.com/n0-computer/iroh/tree/main/iroh-gossip
 
 ### 4.2 Inference engine (per-node)
-- **SwiftLM** — MLX fork with SSD expert streaming
+- **SharpAI/mlx** — MLX fork that carries the SSD streaming primitive. This is the fork we actually build against.
+  - Repo: https://github.com/SharpAI/mlx
+  - Key files: `mlx/backend/metal/ssd_streamer.{mm,h}`, `mlx/core/moe_stream_op.{cpp,h}`, `mlx/backend/metal/kernels/{fence,moe_stream}.metal`
+  - Reference commit: `9a9c214` ("feat: custom ssd-streaming kernels and custom MLX I/O fast loaders")
+  - License: MIT
+  - See `docs/ENGINE_RESEARCH.md` for a file:line walkthrough.
+- **SwiftLM** — Swift wrapper that sits on top of MLX. Not on the critical path for v1; we may or may not consume any of it depending on whether we need its Swift-side tokenization/weight-loading helpers.
   - Repo: https://github.com/SharpAI/SwiftLM
-  - MLX fork: https://github.com/SharpAI/mlx
-  - MLX-C fork: https://github.com/SharpAI/mlx-c
-  - Key files we fork: `ssd_streamer.mm`, `fence.air`
   - License: MIT
   - Author: Eric Lake (SharpAI)
+- **SharpAI/mlx-c** — C bindings for MLX. Candidate for the `mtw-engine` FFI layer.
+  - Repo: https://github.com/SharpAI/mlx-c
 
 ### 4.3 Mesh coordination reference
 - **Mesh-LLM** — reference for iroh usage patterns and agent integration
@@ -123,9 +128,14 @@ User points Claude Code at `http://localhost:9337`. Claude Code sends a prompt. 
 ## 5. The novel contributions (what we build, not borrow)
 
 ### 5.1 Per-node SSD streaming inside a mesh
-- Fork SwiftLM's `ssd_streamer.mm` and `fence.air`
-- Adapt for 4–8GB RAM budget (SwiftLM currently targets 64GB+)
-- Key changes: smaller hot cache, aggressive LRU eviction, async prefetch coordination with mesh scheduler
+
+Upstream reality (see `docs/ENGINE_RESEARCH.md`): SharpAI/mlx already ships the SSD→GPU primitive (pinned `MTLBuffer` + `pread` + a Metal 4-bit GEMM kernel), but the hot path is **synchronous and per-forward-pass** — no expert-level cache, no prefetch. The `io_queue_` and `MTL::SharedEvent shared_event_` hooks are constructed but inert.
+
+What we build:
+- **Expert-aware LRU cache** keyed by `active_expert` id, living in `mtw-engine` / `mtw-cache`. Deferred deallocation past end of forward pass, so hot experts stay resident.
+- **Async prefetch path**: reactivate the dormant `io_queue_` for non-blocking `load_async`, wire `shared_event_` into a Metal command buffer wait so compute overlaps with next-expert load.
+- **Allocator ceiling tuning** via `MetalAllocator::set_memory_limit()` for the 4–8GB unified-memory budget. No `MLX` source changes needed for this — caller-side init only.
+- **4–8GB budget constants** live in our cache layer, not upstream; MLX has no such knob today.
 
 ### 5.2 Usage-adaptive expert caching
 - Per-node instrumentation: record which experts fire on user's actual prompts
@@ -271,11 +281,16 @@ mtw download <model>         # Fetch a model to local SSD
 ### Milestone 2 (Month 2): Per-node SSD streaming on 8GB
 **Goal**: Get Qwen3-Coder-30B-A3B running on a single 8GB Mac.
 
-- [ ] Fork SwiftLM to new repo `mtw-engine`
-- [ ] Modify hot cache size constants for 3GB budget
-- [ ] Implement aggressive LRU eviction
-- [ ] Test on M2 8GB, expect 2–4 tok/s initially
-- [ ] Profile expert activation patterns on 500 coding prompts
+Revised task list after the research in `docs/ENGINE_RESEARCH.md`:
+
+- [ ] Build SharpAI/mlx locally at `9a9c214`, verify `streamed_gather_mm` works end-to-end via a standalone C++ test (no Rust yet)
+- [ ] C++ shim crate exposing `SSDStreamer::new/load_sync/free`, `streamed_gather_mm`, and the existing `mlx_ssd_metrics_snapshot` as `extern "C"`
+- [ ] Rust FFI in `mtw-engine` (`cxx` crate or hand-rolled `bindgen`) over the shim
+- [ ] Expert-aware LRU cache in `mtw-cache`, plugged in between the mesh scheduler and `SSDStreamer::load_sync`
+- [ ] Async prefetch: reactivate `io_queue_` in `ssd_streamer.mm`, wire `shared_event_` into the Metal command buffer so compute and next-expert load overlap
+- [ ] `MetalAllocator::set_memory_limit()` called at engine init for the 4–8GB budget
+- [ ] Test on M2 8GB with Qwen3-Coder-30B-A3B, target 2–4 tok/s initially
+- [ ] Profile expert activation patterns on 500 coding prompts (feeds Milestone 4)
 - [ ] Publish results as draft blog post
 
 **Deliverable**: Single-node inference running at 2–5 tok/s on 8GB M2.
@@ -439,8 +454,8 @@ meshthatworks/
 │   ├── mtw-cache/          # adaptive expert caching
 │   ├── mtw-api/            # OpenAI-compatible API
 │   └── mtw-cli/            # binary entry point
-├── swiftlm-fork/           # our fork of SwiftLM (submodule or vendored)
-├── mlx-fork/               # our fork of SharpAI/mlx (submodule)
+├── mlx-fork/               # our fork of SharpAI/mlx (submodule) — carries ssd_streamer + moe_stream_op
+├── swiftlm-fork/           # optional; only if we end up reusing SwiftLM's Swift-side helpers
 ├── docs/
 │   ├── BASELINES.md        # milestone 1 deliverable
 │   ├── ARCHITECTURE.md     # this document, refined
