@@ -19,6 +19,10 @@ This is the target hardware class the project was designed for — the 8 GB cons
 | upstream MLX 0.31.2 (pip) | OLMoE-1B-7B-0125-Instruct-4bit | 8.7 s | 3.6 | 2026-04-23 | full model in RAM, no streaming |
 | SharpAI/mlx fork (patched) | OLMoE-1B-7B-0125-Instruct-4bit | — | — | — | **built 2026-04-23**, `libmlx.a` 34 MB, needs `patches/sharpai-mlx-cmake-hookup.patch`. Integration test not yet written. |
 | SharpAI/mlx fork + `streamed_gather_mm` | OLMoE-1B-7B-0125-Instruct-4bit | — | — | — | SSD streaming path, not yet exercised |
+| SwiftLM (`--stream-experts`) | LFM2-8B-A1B-4bit (5 GB) | 2 s | **1.6–1.8** | 2026-04-23 | works, but crashes after 1–2 requests on 8 GB Mac (MEM_DEMAND ≈ 6.6 GB) |
+| SwiftLM (`--stream-experts --ssd-prefetch`) | LFM2-8B-A1B-4bit (5 GB) | 2 s | **2.78** (1st req only) | 2026-04-23 | PAPPS 16-worker prefetch on — ~50% uplift before OOM |
+| SwiftLM (no streaming) | Qwen3-8B-4bit (4.3 GB dense) | — | — | 2026-04-23 | `SWAP-ASSISTED` mode, first request killed server. Dense 8B too big for 8 GB Mac single-node. |
+| SwiftLM (no streaming) | LFM2-8B-A1B-4bit | — | — | 2026-04-23 | Both requests timed out at 90 s — streaming is *required*, not optional, on this hardware |
 | Mesh-LLM | Qwen3-Coder-30B-A3B | — | — | — | not tried, requires 2 devices |
 | Prima.cpp | matched | — | — | — | not tried |
 | mtw two-node mesh (target) | Qwen3-Coder-30B-A3B | — | **≥8** | target | spec §9 success criterion |
