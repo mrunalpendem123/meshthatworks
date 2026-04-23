@@ -12,3 +12,9 @@ description = "Per-node inference engine: MLX FFI, SSD expert streaming, KV cach
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }

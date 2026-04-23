@@ -1955,6 +1955,12 @@ dependencies = [
 [[package]]
 name = "mtw-engine"
 version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+ "tokio",
+]
 
 [[package]]
 name = "n0-error"
