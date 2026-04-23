@@ -8,7 +8,17 @@
 
 ## 0. Key findings that diverge from ARCHITECTURE.md
 
-Five things the spec describes that don't match the code on disk. Flagging up front so the milestone plan can adjust.
+Six things the spec describes that don't match the code on disk. Flagging up front so the milestone plan can adjust.
+
+**0 (added 2026-04-23). The fork never hooked the streaming code into its build system.** `moe_stream_op.{cpp,h}`, `ssd_streamer.{mm,h}`, and `moe_stream.metal` all exist in the tree but are **not referenced by any `CMakeLists.txt`**. A default `cmake --build` produces a `libmlx.a` that contains zero streaming symbols — the files are orphans. Three one-line CMake additions fix this (captured in `patches/sharpai-mlx-cmake-hookup.patch`):
+
+- `mlx/CMakeLists.txt`: add `${CMAKE_CURRENT_SOURCE_DIR}/core/moe_stream_op.cpp` to `target_sources(mlx PRIVATE ...)`
+- `mlx/backend/metal/CMakeLists.txt`: add `${CMAKE_CURRENT_SOURCE_DIR}/ssd_streamer.mm` to `target_sources(mlx PRIVATE ...)`
+- `mlx/backend/metal/kernels/CMakeLists.txt`: add `build_kernel(moe_stream)` after the fence block
+
+After the patch, `libmlx.a` ships all the expected symbols: `mlx::core::streamed_gather_mm`, `mlx::core::fast::SSDStreamer::{ctor,dtor,load_sync}`, `mlx::core::LoadSSDExpert::eval_impl`, the `extern "C" mlx_ssd_metrics_snapshot`, and `streamed_moe_gemm` inside `mlx/backend/metal/kernels/mlx.metallib`. Verified locally on macOS 26.2 + Xcode 26 + Metal Toolchain 17E188.
+
+
 
 1. **Files live in MLX, not SwiftLM.** The spec (§4.2, §5.1) says we fork `ssd_streamer.mm` and `fence.air` from SwiftLM. They're actually in the MLX fork at `mlx/backend/metal/`. SwiftLM is a Swift wrapper around MLX and contains no `.mm` or `.air` files. Practical impact: our fork target is `SharpAI/mlx`, not `SharpAI/SwiftLM` (or both, with MLX carrying the streaming layer).
 

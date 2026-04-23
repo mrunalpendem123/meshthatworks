@@ -17,7 +17,7 @@ This is the target hardware class the project was designed for — the 8 GB cons
 | Runner | Model | Load | Gen tok/s | Date | Notes |
 |---|---|---|---|---|---|
 | upstream MLX 0.31.2 (pip) | OLMoE-1B-7B-0125-Instruct-4bit | 8.7 s | 3.6 | 2026-04-23 | full model in RAM, no streaming |
-| SharpAI/mlx fork | OLMoE-1B-7B-0125-Instruct-4bit | — | — | — | fork not yet built |
+| SharpAI/mlx fork (patched) | OLMoE-1B-7B-0125-Instruct-4bit | — | — | — | **built 2026-04-23**, `libmlx.a` 34 MB, needs `patches/sharpai-mlx-cmake-hookup.patch`. Integration test not yet written. |
 | SharpAI/mlx fork + `streamed_gather_mm` | OLMoE-1B-7B-0125-Instruct-4bit | — | — | — | SSD streaming path, not yet exercised |
 | Mesh-LLM | Qwen3-Coder-30B-A3B | — | — | — | not tried, requires 2 devices |
 | Prima.cpp | matched | — | — | — | not tried |
