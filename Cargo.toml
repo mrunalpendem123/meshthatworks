@@ -1,0 +1,37 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mtw-core",
+    "crates/mtw-engine",
+    "crates/mtw-cache",
+    "crates/mtw-api",
+    "crates/mtw-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["MeshThatWorks contributors"]
+repository = "https://github.com/TBD/meshthatworks"
+rust-version = "1.89"
+
+[workspace.dependencies]
+iroh = "0.98"
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+mtw-core = { path = "crates/mtw-core" }
+mtw-engine = { path = "crates/mtw-engine" }
+mtw-cache = { path = "crates/mtw-cache" }
+mtw-api = { path = "crates/mtw-api" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

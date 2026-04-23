@@ -1,0 +1,14 @@
+[package]
+name = "mtw-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Per-node inference engine: MLX FFI, SSD expert streaming, KV cache, activation profiling."
+
+[lints]
+workspace = true
+
+[dependencies]
