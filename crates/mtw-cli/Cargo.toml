@@ -17,6 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 mtw-core.workspace = true
+mtw-engine.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true

@@ -1,4 +1,7 @@
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
+use mtw_engine::{InferenceEngine, MockEngine};
 
 #[derive(Parser)]
 #[command(
@@ -13,6 +16,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Run the always-on mesh node.
+    Serve,
+    /// Show local info and ping every paired peer.
+    Status,
     /// Transport diagnostics — iroh echo listen/dial.
     #[command(subcommand)]
     Echo(EchoCmd),
@@ -52,6 +59,15 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
+        Command::Serve => {
+            let secret = mtw_core::identity::load_or_create()?;
+            let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine::olmoe());
+            mtw_core::serve::run(secret, engine).await
+        }
+        Command::Status => {
+            let secret = mtw_core::identity::load_or_create()?;
+            mtw_core::status::run(secret).await
+        }
         Command::Echo(EchoCmd::Listen) => mtw_core::echo::listen().await,
         Command::Echo(EchoCmd::Dial { target, message }) => {
             let joined = message.join(" ");
