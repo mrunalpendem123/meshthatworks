@@ -123,14 +123,18 @@ enum EchoCmd {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .init();
-
     let cli = Cli::parse();
+
+    // The dashboard is a full-screen TUI in raw mode; any writer that touches
+    // stderr will paint over the frame. Route logs to a file instead. Users
+    // can tail `/tmp/mtw-dashboard.log` (or set MTW_LOG_FILE) for details.
+    // Other commands keep stderr logging.
+    if matches!(cli.command, Command::Dashboard { .. }) {
+        init_tracing_file()?;
+    } else {
+        init_tracing_stderr();
+    }
+
     match cli.command {
         Command::Serve {
             model,
@@ -355,6 +359,33 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     // Grace period for the child to receive SIGKILL and exit.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     result
+}
+
+fn env_filter() -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"))
+}
+
+fn init_tracing_stderr() {
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter())
+        .init();
+}
+
+fn init_tracing_file() -> anyhow::Result<()> {
+    let log_path = std::env::var("MTW_LOG_FILE")
+        .unwrap_or_else(|_| "/tmp/mtw-dashboard.log".into());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open log file {log_path}"))?;
+    tracing_subscriber::fmt()
+        .with_writer(file)
+        .with_ansi(false)
+        .with_env_filter(env_filter())
+        .init();
+    Ok(())
 }
 
 fn peers_cmd() -> anyhow::Result<()> {
