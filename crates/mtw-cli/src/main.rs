@@ -1,8 +1,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
-use mtw_engine::{ChatMessage, ChatRequest, InferenceEngine, MockEngine, SwiftLMEngine};
+use mtw_api::ProxyConfig;
+use mtw_engine::{
+    ChatMessage, ChatRequest, InferenceEngine, MockEngine, SwiftLMEngine,
+    swiftlm::SwiftLMOptions,
+};
+
+const DEFAULT_SWIFTLM_BINARY: &str =
+    "/Users/mrunalpendem/Desktop/meshthatworks-deps/SwiftLM/.build/release/SwiftLM";
+const DEFAULT_MODEL_DIR: &str =
+    "/Users/mrunalpendem/Desktop/meshthatworks-deps/models/Qwen3-30B-A3B-4bit";
+const DEFAULT_SWIFTLM_PORT: u16 = 9876;
+const DEFAULT_PROXY_PORT: u16 = 9337;
 
 #[derive(Parser)]
 #[command(
@@ -17,8 +29,31 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the always-on mesh node.
-    Serve,
+    /// Run the always-on mesh node: spawns SwiftLM, serves iroh mesh, and
+    /// exposes an OpenAI-compatible HTTP proxy on port 9337.
+    Serve {
+        /// Path to the model directory (must contain config.json + safetensors).
+        #[arg(long, default_value = DEFAULT_MODEL_DIR)]
+        model: PathBuf,
+        /// Path to the SwiftLM binary.
+        #[arg(long, default_value = DEFAULT_SWIFTLM_BINARY)]
+        swiftlm: PathBuf,
+        /// Port SwiftLM listens on internally.
+        #[arg(long, default_value_t = DEFAULT_SWIFTLM_PORT)]
+        swiftlm_port: u16,
+        /// Port our OpenAI-compatible proxy listens on (user-facing).
+        #[arg(long, default_value_t = DEFAULT_PROXY_PORT)]
+        proxy_port: u16,
+        /// GPU memory limit for SwiftLM (MB).
+        #[arg(long, default_value_t = 4096)]
+        mem_limit: u32,
+        /// Skip SwiftLM spawn; use MockEngine (for testing iroh mesh only).
+        #[arg(long)]
+        mock: bool,
+        /// Attach to an already-running SwiftLM at this URL instead of spawning.
+        #[arg(long, conflicts_with_all = &["mock", "swiftlm"])]
+        attach: Option<String>,
+    },
     /// Show local info and ping every paired peer.
     Status,
     /// Transport diagnostics — iroh echo listen/dial.
@@ -33,13 +68,13 @@ enum Command {
     },
     /// List peers saved at ~/.mtw/peers.json.
     Peers,
-    /// Send a single chat completion to a running SwiftLM server.
+    /// Send a single chat completion to a running server (SwiftLM or mtw-api).
     Chat {
         /// Prompt text. Combine multiple words without quoting.
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
-        /// Base URL of the SwiftLM server.
-        #[arg(long, default_value = "http://127.0.0.1:9876")]
+        /// Base URL of the server.
+        #[arg(long, default_value = "http://127.0.0.1:9337")]
         url: String,
         /// Max tokens to generate.
         #[arg(long, default_value_t = 120)]
@@ -47,7 +82,7 @@ enum Command {
         /// Sampling temperature.
         #[arg(long, default_value_t = 0.7)]
         temperature: f32,
-        /// Optional path to the model directory, used for populating model info.
+        /// Optional path to the model directory for populating model info.
         #[arg(long)]
         model_dir: Option<PathBuf>,
     },
@@ -55,13 +90,9 @@ enum Command {
 
 #[derive(Subcommand)]
 enum EchoCmd {
-    /// Listen for echo connections and print the endpoint id.
     Listen,
-    /// Dial an echo listener and send a message.
     Dial {
-        /// Endpoint id printed by `mtw echo listen`.
         target: String,
-        /// Message to echo. Multiple words are joined with spaces.
         #[arg(trailing_var_arg = true, required = true)]
         message: Vec<String>,
     },
@@ -78,10 +109,25 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Serve => {
-            let secret = mtw_core::identity::load_or_create()?;
-            let engine: Arc<dyn InferenceEngine> = Arc::new(MockEngine::olmoe());
-            mtw_core::serve::run(secret, engine).await
+        Command::Serve {
+            model,
+            swiftlm,
+            swiftlm_port,
+            proxy_port,
+            mem_limit,
+            mock,
+            attach,
+        } => {
+            serve_cmd(ServeArgs {
+                model,
+                swiftlm,
+                swiftlm_port,
+                proxy_port,
+                mem_limit,
+                mock,
+                attach,
+            })
+            .await
         }
         Command::Status => {
             let secret = mtw_core::identity::load_or_create()?;
@@ -111,6 +157,133 @@ async fn main() -> anyhow::Result<()> {
     }
 }
 
+struct ServeArgs {
+    model: PathBuf,
+    swiftlm: PathBuf,
+    swiftlm_port: u16,
+    proxy_port: u16,
+    mem_limit: u32,
+    mock: bool,
+    attach: Option<String>,
+}
+
+async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
+    let secret = mtw_core::identity::load_or_create()?;
+
+    // Build the engine according to the flags.
+    let engine: Arc<dyn InferenceEngine> = if args.mock {
+        println!("mtw serve: --mock set, using MockEngine (no real inference)");
+        Arc::new(MockEngine::olmoe())
+    } else if let Some(url) = args.attach.clone() {
+        println!("mtw serve: attaching to SwiftLM at {url}");
+        let engine = SwiftLMEngine::attach(&url, Some(&args.model))
+            .await
+            .with_context(|| format!("attach SwiftLM at {url}"))?;
+        Arc::new(engine)
+    } else {
+        println!("mtw serve: spawning SwiftLM");
+        println!("  binary: {}", args.swiftlm.display());
+        println!("  model:  {}", args.model.display());
+        println!("  port:   {}", args.swiftlm_port);
+        let mut opts = SwiftLMOptions::new(&args.swiftlm, &args.model);
+        opts.port = args.swiftlm_port;
+        opts.mem_limit_mb = Some(args.mem_limit);
+        opts.stream_experts = true;
+        opts.ssd_prefetch = true;
+        let engine = SwiftLMEngine::spawn(opts)
+            .await
+            .context("spawn SwiftLM")?;
+        Arc::new(engine)
+    };
+
+    // Proxy forwards to whatever engine's URL is. For MockEngine there is
+    // no upstream; we skip the proxy in that case.
+    let upstream = if !args.mock {
+        Some(match &args.attach {
+            Some(url) => url.clone(),
+            None => format!("http://127.0.0.1:{}", args.swiftlm_port),
+        })
+    } else {
+        None
+    };
+
+    // Run the iroh mesh + the HTTP proxy concurrently. First error wins OR
+    // a shutdown signal aborts both and we drop the engine to propagate
+    // `kill_on_drop` to the SwiftLM child.
+    let mesh_engine = engine.clone();
+    let mut mesh_handle =
+        tokio::spawn(async move { mtw_core::serve::run(secret, mesh_engine).await });
+
+    let proxy_cfg = upstream.map(|upstream| ProxyConfig {
+        bind: format!("127.0.0.1:{}", args.proxy_port).parse().unwrap(),
+        upstream,
+        model_label: Some(engine.model_info().name.clone()),
+    });
+    let mut proxy_handle = proxy_cfg.map(|cfg| tokio::spawn(async move { mtw_api::run(cfg).await }));
+
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            let mut term = signal(SignalKind::terminate()).expect("install SIGTERM handler");
+            let mut int = signal(SignalKind::interrupt()).expect("install SIGINT handler");
+            tokio::select! {
+                _ = term.recv() => "SIGTERM",
+                _ = int.recv() => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::signal::ctrl_c().await.ok();
+            "ctrl-c"
+        }
+    };
+
+    let proxy_fut = async {
+        match proxy_handle.as_mut() {
+            Some(h) => h.await,
+            None => std::future::pending().await,
+        }
+    };
+
+    let result: anyhow::Result<()> = tokio::select! {
+        res = &mut mesh_handle => match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.context("mesh serve")),
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("mesh task: {e}")),
+        },
+        res = proxy_fut => match res {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(e.context("api proxy")),
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("proxy task: {e}")),
+        },
+        sig = shutdown => {
+            println!();
+            println!("mtw serve: {sig} received, shutting down");
+            Ok(())
+        }
+    };
+
+    // Abort both tasks; this drops their Arc<dyn InferenceEngine> clones.
+    mesh_handle.abort();
+    if let Some(h) = &proxy_handle {
+        h.abort();
+    }
+    let _ = mesh_handle.await;
+    if let Some(h) = proxy_handle {
+        let _ = h.await;
+    }
+
+    // Now only our `engine` Arc remains; dropping it runs SwiftLMEngine::drop
+    // which kills the child thanks to Command::kill_on_drop(true).
+    drop(engine);
+    // Small grace period for the child to receive SIGKILL and exit.
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    result
+}
+
 fn peers_cmd() -> anyhow::Result<()> {
     let list = mtw_core::peers::load()?;
     if list.peers.is_empty() {
@@ -133,7 +306,7 @@ async fn chat_cmd(
 ) -> anyhow::Result<()> {
     let engine = SwiftLMEngine::attach(&url, model_dir.as_deref()).await?;
     let info = engine.model_info();
-    eprintln!("connected to SwiftLM at {url}");
+    eprintln!("connected to {url}");
     eprintln!("model: {} (layers={}, hidden={})", info.name, info.num_layers, info.hidden_size);
     eprintln!();
 
@@ -155,4 +328,3 @@ async fn chat_cmd(
     );
     Ok(())
 }
-

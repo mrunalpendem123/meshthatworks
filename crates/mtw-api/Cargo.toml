@@ -6,9 +6,20 @@ license.workspace = true
 authors.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "OpenAI-compatible HTTP API on localhost:9337, SSE token streaming."
+description = "OpenAI-compatible HTTP proxy on localhost:9337. Forwards to local SwiftLM today; will route to peers once mesh inference lands."
 
 [lints]
 workspace = true
 
 [dependencies]
+anyhow.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
+axum.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+mtw-engine.workspace = true

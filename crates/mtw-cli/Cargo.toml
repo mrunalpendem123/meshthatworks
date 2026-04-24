@@ -18,7 +18,9 @@ path = "src/main.rs"
 [dependencies]
 mtw-core.workspace = true
 mtw-engine.workspace = true
+mtw-api.workspace = true
 clap.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+tracing.workspace = true
 tracing-subscriber.workspace = true
