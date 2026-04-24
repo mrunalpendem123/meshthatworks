@@ -72,45 +72,68 @@ fn decode_invite(invite: &str) -> anyhow::Result<(EndpointId, String)> {
     Ok((id, code.to_string()))
 }
 
+/// An active pairing session. `invite` is ready to share immediately;
+/// call [`PairSession::wait_for_peer`] to block until a peer redeems it.
+pub struct PairSession {
+    pub invite: String,
+    endpoint: Endpoint,
+    code: String,
+}
+
+impl PairSession {
+    pub async fn start(secret: SecretKey) -> anyhow::Result<Self> {
+        let endpoint = Endpoint::builder(presets::N0)
+            .secret_key(secret)
+            .alpns(vec![PAIR_ALPN.to_vec()])
+            .bind()
+            .await
+            .context("bind pairing endpoint")?;
+        endpoint.online().await;
+        let id = endpoint.id();
+        let code = generate_code();
+        let invite = encode_invite(&id, &code);
+        Ok(Self {
+            invite,
+            endpoint,
+            code,
+        })
+    }
+
+    /// Accept connections until one presents the correct passcode. Returns
+    /// the joiner's endpoint id and records them to `~/.mtw/peers.json`.
+    pub async fn wait_for_peer(self) -> anyhow::Result<EndpointId> {
+        while let Some(incoming) = self.endpoint.accept().await {
+            match handle_join_attempt(incoming, &self.code).await {
+                Ok(peer_id) => {
+                    crate::peers::record(&peer_id.to_string())?;
+                    self.endpoint.close().await;
+                    return Ok(peer_id);
+                }
+                Err(err) => {
+                    tracing::warn!(%err, "rejected pairing attempt");
+                }
+            }
+        }
+        anyhow::bail!("pairing endpoint closed before a peer joined")
+    }
+}
+
+/// CLI convenience: start a session, print the invite, wait for a peer.
 pub async fn pair(secret: SecretKey) -> anyhow::Result<()> {
-    let endpoint = Endpoint::builder(presets::N0)
-        .secret_key(secret)
-        .alpns(vec![PAIR_ALPN.to_vec()])
-        .bind()
-        .await
-        .context("bind pairing endpoint")?;
-
-    endpoint.online().await;
-
-    let id = endpoint.id();
-    let code = generate_code();
-    let invite = encode_invite(&id, &code);
-
+    let session = PairSession::start(secret).await?;
     println!("mtw pair: waiting for a peer to join.");
     println!();
     println!("share this invite with your other device:");
     println!();
-    println!("    {invite}");
+    println!("    {}", session.invite);
     println!();
     println!("on the other device, run:  mtw join <invite>");
     println!();
     println!("press ctrl-c to cancel.");
-
-    while let Some(incoming) = endpoint.accept().await {
-        match handle_join_attempt(incoming, &code).await {
-            Ok(peer_id) => {
-                crate::peers::record(&peer_id.to_string())?;
-                println!();
-                println!("paired with {peer_id}");
-                println!("recorded in ~/.mtw/peers.json");
-                endpoint.close().await;
-                return Ok(());
-            }
-            Err(err) => {
-                eprintln!("rejected pairing attempt: {err:#}");
-            }
-        }
-    }
+    let peer_id = session.wait_for_peer().await?;
+    println!();
+    println!("paired with {peer_id}");
+    println!("recorded in ~/.mtw/peers.json");
     Ok(())
 }
 

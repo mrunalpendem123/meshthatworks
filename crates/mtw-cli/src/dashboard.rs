@@ -38,6 +38,7 @@ use iroh::{Endpoint, EndpointId, endpoint::presets};
 use mtw_api::NodeStatus;
 use mtw_core::{
     health::{Pong, ping_peer},
+    pair::PairSession,
     peers::{Peer, PeerList},
 };
 use ratatui::{
@@ -134,10 +135,35 @@ struct ModelRow {
     owned_by: String,
 }
 
+#[derive(Debug, Clone)]
+enum Overlay {
+    None,
+    Help,
+    Pair {
+        invite: Option<String>,
+        status: String,
+        done: Option<String>, // Some(peer_id) on success
+        error: Option<String>,
+    },
+    Join {
+        input: String,
+        status: String,
+        error: Option<String>,
+        in_flight: bool,
+    },
+}
+
+impl Default for Overlay {
+    fn default() -> Self {
+        Overlay::None
+    }
+}
+
 #[derive(Default)]
 struct SharedState {
     tab: Option<Tab>, // None during splash
     splash_started_at: Option<Instant>,
+    overlay: Overlay,
 
     node: Option<NodeStatus>,
     node_error: Option<String>,
@@ -161,7 +187,6 @@ struct SharedState {
     last_models_refresh: Option<Instant>,
 
     spinner_frame: usize,
-    show_help_overlay: bool,
 }
 
 impl SharedState {
@@ -177,6 +202,7 @@ impl SharedState {
         Self {
             tab: self.tab,
             splash_started_at: self.splash_started_at,
+            overlay: self.overlay.clone(),
             node: self.node.clone(),
             node_error: self.node_error.clone(),
             peers: self.peers.clone(),
@@ -193,7 +219,6 @@ impl SharedState {
             last_ping_round: self.last_ping_round,
             last_models_refresh: self.last_models_refresh,
             spinner_frame: self.spinner_frame,
-            show_help_overlay: self.show_help_overlay,
         }
     }
 
@@ -312,25 +337,65 @@ async fn handle_key(
     url: &str,
 ) -> bool {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let in_chat = {
+    let (in_chat, in_overlay, overlay_kind) = {
         let s = state.lock().await;
-        s.tab == Some(Tab::Chat)
+        let kind = match &s.overlay {
+            Overlay::None => 0u8,
+            Overlay::Help => 1,
+            Overlay::Pair { .. } => 2,
+            Overlay::Join { .. } => 3,
+        };
+        (s.tab == Some(Tab::Chat), kind != 0, kind)
     };
 
-    // Global: always-on keybindings
-    match key.code {
-        KeyCode::Char('c') if ctrl => return true,
-        KeyCode::Esc => {
-            let mut s = state.lock().await;
-            if s.show_help_overlay {
-                s.show_help_overlay = false;
-                return false;
-            }
+    // When an overlay is open, route input to it. Only Esc and Ctrl-C escape.
+    if in_overlay {
+        if ctrl && matches!(key.code, KeyCode::Char('c')) {
             return true;
         }
+        if matches!(key.code, KeyCode::Esc) {
+            state.lock().await.overlay = Overlay::None;
+            return false;
+        }
+        match overlay_kind {
+            2 => {
+                // Pair overlay — nothing to type, Esc closes handled above.
+                return false;
+            }
+            3 => {
+                // Join overlay — text input.
+                match key.code {
+                    KeyCode::Backspace => {
+                        let mut s = state.lock().await;
+                        if let Overlay::Join { input, .. } = &mut s.overlay {
+                            input.pop();
+                        }
+                    }
+                    KeyCode::Enter => {
+                        submit_join(state.clone()).await;
+                    }
+                    KeyCode::Char(c) => {
+                        let mut s = state.lock().await;
+                        if let Overlay::Join { input, in_flight, .. } = &mut s.overlay {
+                            if !*in_flight {
+                                input.push(c);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                return false;
+            }
+            _ => return false, // Help overlay: just Esc.
+        }
+    }
+
+    // Global keys
+    match key.code {
+        KeyCode::Char('c') if ctrl => return true,
+        KeyCode::Esc => return true,
         KeyCode::Char('?') | KeyCode::F(1) => {
-            let mut s = state.lock().await;
-            s.show_help_overlay = !s.show_help_overlay;
+            state.lock().await.overlay = Overlay::Help;
             return false;
         }
         KeyCode::Tab | KeyCode::Right => {
@@ -367,7 +432,25 @@ async fn handle_key(
         _ => {}
     }
 
-    // Direct tab navigation via digits (anywhere except when typing)
+    // Peers-tab actions: P to pair, J to join.
+    let in_peers = state.lock().await.tab == Some(Tab::Peers);
+    if in_peers {
+        if let KeyCode::Char('p') | KeyCode::Char('P') = key.code {
+            start_pair(state.clone()).await;
+            return false;
+        }
+        if let KeyCode::Char('j') | KeyCode::Char('J') = key.code {
+            state.lock().await.overlay = Overlay::Join {
+                input: String::new(),
+                status: "paste the invite string from the other device, then Enter".into(),
+                error: None,
+                in_flight: false,
+            };
+            return false;
+        }
+    }
+
+    // Digits jump tabs, unless typing in Chat input.
     if !in_chat {
         if let KeyCode::Char(c) = key.code {
             if let Some(d) = c.to_digit(10) {
@@ -383,12 +466,11 @@ async fn handle_key(
         }
     }
 
-    // Chat input
+    // Chat input.
     if in_chat {
         match key.code {
             KeyCode::Backspace => {
-                let mut s = state.lock().await;
-                s.input.pop();
+                state.lock().await.input.pop();
             }
             KeyCode::Enter => {
                 send_prompt(state.clone(), url.to_string()).await;
@@ -403,6 +485,138 @@ async fn handle_key(
         }
     }
     false
+}
+
+// ---------------------------------------------------------- pair / join
+
+async fn start_pair(state: Arc<Mutex<SharedState>>) {
+    {
+        let mut s = state.lock().await;
+        if matches!(s.overlay, Overlay::Pair { .. }) {
+            return; // already running
+        }
+        s.overlay = Overlay::Pair {
+            invite: None,
+            status: "binding pairing endpoint…".into(),
+            done: None,
+            error: None,
+        };
+        s.push_activity(ActivityKind::Info, "pair: starting session");
+    }
+
+    tokio::spawn(async move {
+        let secret = match mtw_core::identity::load_or_create() {
+            Ok(s) => s,
+            Err(e) => {
+                let mut st = state.lock().await;
+                st.overlay = Overlay::Pair {
+                    invite: None,
+                    status: String::new(),
+                    done: None,
+                    error: Some(format!("identity: {e:#}")),
+                };
+                return;
+            }
+        };
+        match PairSession::start(secret).await {
+            Ok(session) => {
+                let invite = session.invite.clone();
+                {
+                    let mut st = state.lock().await;
+                    st.overlay = Overlay::Pair {
+                        invite: Some(invite.clone()),
+                        status: "waiting for a peer to join…".into(),
+                        done: None,
+                        error: None,
+                    };
+                    st.push_activity(ActivityKind::Ok, format!("pair: invite ready"));
+                }
+                match session.wait_for_peer().await {
+                    Ok(peer_id) => {
+                        let mut st = state.lock().await;
+                        st.overlay = Overlay::Pair {
+                            invite: Some(invite),
+                            status: "paired".into(),
+                            done: Some(peer_id.to_string()),
+                            error: None,
+                        };
+                        st.push_activity(
+                            ActivityKind::Ok,
+                            format!("pair: peer {} joined", short_id(&peer_id.to_string())),
+                        );
+                    }
+                    Err(e) => {
+                        let mut st = state.lock().await;
+                        st.overlay = Overlay::Pair {
+                            invite: Some(invite),
+                            status: String::new(),
+                            done: None,
+                            error: Some(format!("{e:#}")),
+                        };
+                        st.push_activity(ActivityKind::Err, format!("pair: {e}"));
+                    }
+                }
+            }
+            Err(e) => {
+                let mut st = state.lock().await;
+                st.overlay = Overlay::Pair {
+                    invite: None,
+                    status: String::new(),
+                    done: None,
+                    error: Some(format!("{e:#}")),
+                };
+                st.push_activity(ActivityKind::Err, format!("pair: {e}"));
+            }
+        }
+    });
+}
+
+async fn submit_join(state: Arc<Mutex<SharedState>>) {
+    let invite = {
+        let mut s = state.lock().await;
+        match &mut s.overlay {
+            Overlay::Join { input, in_flight, error, status } => {
+                if *in_flight || input.trim().is_empty() {
+                    return;
+                }
+                *in_flight = true;
+                *error = None;
+                *status = "contacting peer…".into();
+                input.trim().to_string()
+            }
+            _ => return,
+        }
+    };
+
+    tokio::spawn(async move {
+        let secret = match mtw_core::identity::load_or_create() {
+            Ok(s) => s,
+            Err(e) => {
+                let mut st = state.lock().await;
+                if let Overlay::Join { in_flight, error, .. } = &mut st.overlay {
+                    *in_flight = false;
+                    *error = Some(format!("identity: {e:#}"));
+                }
+                return;
+            }
+        };
+        match mtw_core::pair::join(secret, &invite).await {
+            Ok(()) => {
+                let mut st = state.lock().await;
+                st.overlay = Overlay::None;
+                st.push_activity(ActivityKind::Ok, "join: paired successfully");
+            }
+            Err(e) => {
+                let mut st = state.lock().await;
+                if let Overlay::Join { in_flight, error, status, .. } = &mut st.overlay {
+                    *in_flight = false;
+                    *error = Some(format!("{e:#}"));
+                    *status = "try again or Esc to cancel".into();
+                }
+                st.push_activity(ActivityKind::Err, format!("join: {e}"));
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------- send + stream
@@ -770,8 +984,15 @@ fn render(f: &mut ratatui::Frame, s: &SharedState) {
 
     render_footer(f, rows[2], s);
 
-    if s.show_help_overlay {
-        render_help_overlay(f, area);
+    match &s.overlay {
+        Overlay::None => {}
+        Overlay::Help => render_help_overlay(f, area),
+        Overlay::Pair { invite, status, done, error } => {
+            render_pair_overlay(f, area, invite.as_deref(), status, done.as_deref(), error.as_deref());
+        }
+        Overlay::Join { input, status, error, in_flight } => {
+            render_join_overlay(f, area, input, status, error.as_deref(), *in_flight, s.spinner_frame);
+        }
     }
 }
 
@@ -1200,12 +1421,25 @@ fn render_tab_peers(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
             Style::default().fg(MUTED),
         )));
         lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "[P]",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  pair this device   — shows an invite string you share with the other device"),
+        ]));
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                "[J]",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  join another device — paste an invite you received"),
+        ]));
+        lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  to pair:   run `mtw pair` on one device → copy the invite",
-            Style::default().fg(MUTED),
-        )));
-        lines.push(Line::from(Span::styled(
-            "              run `mtw join <invite>` on the other device",
+            "  on the OTHER device, run `mtw dashboard`, come to Peers, press P or J.",
             Style::default().fg(MUTED),
         )));
     } else {
@@ -1311,6 +1545,8 @@ fn render_tab_help(f: &mut ratatui::Frame, area: Rect) {
         ("1 / 2 / 3 / 4 / 5", "jump to Dashboard / Chat / Peers / Models / Help"),
         ("Enter (Chat)", "send prompt"),
         ("Ctrl-L (Chat)", "clear chat history"),
+        ("P (Peers)", "pair this device — shows invite string"),
+        ("J (Peers)", "join another device — paste an invite"),
         ("Ctrl-R", "force an immediate peer-ping round"),
         ("?  or  F1", "toggle this help overlay"),
         ("Esc or Ctrl-C or q", "quit"),
@@ -1361,6 +1597,172 @@ fn render_help_overlay(f: &mut ratatui::Frame, area: Rect) {
     };
     f.render_widget(Clear, r);
     render_tab_help(f, r);
+}
+
+fn center_rect(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width.saturating_sub(4));
+    let h = h.min(area.height.saturating_sub(4));
+    Rect {
+        x: (area.width.saturating_sub(w)) / 2,
+        y: (area.height.saturating_sub(h)) / 2,
+        width: w,
+        height: h,
+    }
+}
+
+fn render_pair_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    invite: Option<&str>,
+    status: &str,
+    done: Option<&str>,
+    error: Option<&str>,
+) {
+    let w = 90;
+    let h = 14;
+    let r = center_rect(area, w, h);
+    f.render_widget(Clear, r);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Pair a new device ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+
+    let mut lines: Vec<Line> = Vec::new();
+    if let Some(inv) = invite {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "  share this invite with the OTHER device:",
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("    {inv}"),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        )));
+        lines.push(Line::from(""));
+        if let Some(peer) = done {
+            lines.push(Line::from(Span::styled(
+                format!("  ✓ paired with {}", short_id(peer)),
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            )));
+            lines.push(Line::from(Span::styled(
+                "    (recorded in ~/.mtw/peers.json — Esc to close)",
+                Style::default().fg(MUTED),
+            )));
+        } else if let Some(err) = error {
+            lines.push(Line::from(Span::styled(
+                format!("  ✗ {err}"),
+                Style::default().fg(ERR),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("  {status}"),
+                Style::default().fg(MUTED),
+            )));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "    on the other device, open `mtw dashboard`, go to Peers, press J,",
+            Style::default().fg(MUTED),
+        )));
+        lines.push(Line::from(Span::styled(
+            "    paste this invite, and press Enter.",
+            Style::default().fg(MUTED),
+        )));
+    } else if let Some(err) = error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  ✗ failed: {err}"),
+            Style::default().fg(ERR),
+        )));
+    } else {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("  {} {status}", spinner_char(0)),
+            Style::default().fg(MUTED),
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Esc  cancel / close",
+        Style::default().fg(MUTED),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+    );
+}
+
+fn render_join_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    input: &str,
+    status: &str,
+    error: Option<&str>,
+    in_flight: bool,
+    spinner: usize,
+) {
+    let w = 90;
+    let h = 12;
+    let r = center_rect(area, w, h);
+    f.render_widget(Clear, r);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ACCENT))
+        .title(Span::styled(
+            " Join a device ",
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+
+    let cursor: &str = if in_flight { "" } else { "▎" };
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  paste the invite string (starts with `mtw-invite:`):",
+        Style::default().fg(MUTED),
+    )));
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled(
+            "    invite ▸ ",
+            Style::default().fg(OK).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(input.to_string()),
+        Span::styled(
+            cursor.to_string(),
+            Style::default().fg(ACCENT).add_modifier(Modifier::SLOW_BLINK),
+        ),
+    ]));
+    lines.push(Line::from(""));
+    let status_span = if let Some(err) = error {
+        Span::styled(format!("  ✗ {err}"), Style::default().fg(ERR))
+    } else if in_flight {
+        Span::styled(
+            format!("  {} {status}", spinner_char(spinner)),
+            Style::default().fg(WARN),
+        )
+    } else {
+        Span::styled(format!("  {status}"), Style::default().fg(MUTED))
+    };
+    lines.push(Line::from(status_span));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  Enter submit · Esc cancel",
+        Style::default().fg(MUTED),
+    )));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+    );
 }
 
 // ---------------------------------------------------------- helpers
