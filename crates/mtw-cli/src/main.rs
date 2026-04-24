@@ -214,6 +214,13 @@ struct ServeArgs {
 }
 
 async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
+    // Preflight: fail fast if the ports we need are held by stale processes,
+    // before spawning SwiftLM or binding iroh.
+    preflight_port(args.proxy_port, "proxy")?;
+    if args.attach.is_none() && !args.mock {
+        preflight_port(args.swiftlm_port, "SwiftLM")?;
+    }
+
     let secret = mtw_core::identity::load_or_create()?;
 
     // Build the engine according to the flags.
@@ -359,6 +366,29 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     // Grace period for the child to receive SIGKILL and exit.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     result
+}
+
+fn preflight_port(port: u16, label: &str) -> anyhow::Result<()> {
+    match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(l) => {
+            drop(l);
+            Ok(())
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "port {port} ({label}) is already in use: {e}\n\n\
+                 another process is listening there. free it with:\n\
+                 \n\
+                 \tkill -9 $(lsof -ti :{port})\n\
+                 \n\
+                 or kill all mtw/SwiftLM processes at once:\n\
+                 \n\
+                 \tpkill -9 -f 'mtw serve' 2>/dev/null; pkill -9 -f SwiftLM 2>/dev/null\n\
+                 \n\
+                 then retry."
+            );
+        }
+    }
 }
 
 fn env_filter() -> tracing_subscriber::EnvFilter {
