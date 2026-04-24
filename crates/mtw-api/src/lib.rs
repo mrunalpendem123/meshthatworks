@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use axum::{
-    Router,
+    Json, Router,
     body::Body,
     extract::{Path, State},
     http::{HeaderMap, Method, StatusCode, Uri},
@@ -21,6 +21,21 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::TryStreamExt;
+use mtw_engine::ModelInfo;
+use serde::{Deserialize, Serialize};
+
+/// Lightweight snapshot of what a node is doing, served at `GET /status`.
+/// Consumed by `mtw dashboard` and by any future health-monitoring UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatus {
+    pub endpoint_id: String,
+    pub proxy_url: String,
+    pub upstream_url: String,
+    pub alpns: Vec<String>,
+    pub model: ModelInfo,
+    pub started_at_unix: u64,
+    pub version: String,
+}
 
 /// Configuration for the HTTP proxy.
 #[derive(Debug, Clone)]
@@ -31,12 +46,15 @@ pub struct ProxyConfig {
     pub upstream: String,
     /// Optional banner printed at startup.
     pub model_label: Option<String>,
+    /// Snapshot of node identity + model, served at `/status`.
+    pub status: NodeStatus,
 }
 
 #[derive(Clone)]
 struct AppState {
     upstream: Arc<str>,
     client: reqwest::Client,
+    status: Arc<NodeStatus>,
 }
 
 pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
@@ -46,10 +64,12 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
     let state = AppState {
         upstream: Arc::from(cfg.upstream.clone()),
         client,
+        status: Arc::new(cfg.status),
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/status", get(status_handler))
         .route("/v1/models", any(proxy_root))
         .route("/v1/{*path}", any(proxy_passthrough))
         .with_state(state);
@@ -71,6 +91,10 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn status_handler(State(state): State<AppState>) -> Json<Arc<NodeStatus>> {
+    Json(state.status.clone())
 }
 
 async fn proxy_root(

@@ -33,6 +33,9 @@ tower = "0.5"
 http-body-util = "0.1"
 bytes = "1"
 futures-util = "0.3"
+ratatui = "0.30"
+crossterm = "0.29"
+humantime = "2"
 
 mtw-core = { path = "crates/mtw-core" }
 mtw-engine = { path = "crates/mtw-engine" }

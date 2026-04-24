@@ -1,9 +1,12 @@
+mod dashboard;
+
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use mtw_api::ProxyConfig;
+use mtw_api::{NodeStatus, ProxyConfig};
 use mtw_engine::{
     ChatMessage, ChatRequest, InferenceEngine, MockEngine, SwiftLMEngine,
     swiftlm::SwiftLMOptions,
@@ -68,6 +71,18 @@ enum Command {
     },
     /// List peers saved at ~/.mtw/peers.json.
     Peers,
+    /// Launch a terminal UI that shows this node's state and its peers.
+    Dashboard {
+        /// Base URL of the mtw-api proxy to query for /status.
+        #[arg(long, default_value = "http://127.0.0.1:9337")]
+        url: String,
+        /// Refresh cadence in milliseconds.
+        #[arg(long, default_value_t = 500)]
+        tick_ms: u64,
+        /// How often to re-ping peers, in seconds.
+        #[arg(long, default_value_t = 10)]
+        ping_every_s: u64,
+    },
     /// Send a single chat completion to a running server (SwiftLM or mtw-api),
     /// or delegate to a paired peer over iroh (`mtw/infer/0`).
     Chat {
@@ -155,6 +170,16 @@ async fn main() -> anyhow::Result<()> {
             mtw_core::pair::join(secret, &invite).await
         }
         Command::Peers => peers_cmd(),
+        Command::Dashboard {
+            url,
+            tick_ms,
+            ping_every_s,
+        } => dashboard::run(dashboard::DashboardArgs {
+            url,
+            tick: std::time::Duration::from_millis(tick_ms),
+            ping_every: std::time::Duration::from_secs(ping_every_s),
+        })
+        .await,
         Command::Chat {
             prompt,
             url,
@@ -224,6 +249,21 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         None
     };
 
+    let started = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let endpoint_id_str = secret.public().to_string();
+    let node_status = NodeStatus {
+        endpoint_id: endpoint_id_str,
+        proxy_url: format!("http://127.0.0.1:{}", args.proxy_port),
+        upstream_url: upstream.clone().unwrap_or_default(),
+        alpns: vec!["mtw/health/0".into(), "mtw/infer/0".into()],
+        model: engine.model_info().clone(),
+        started_at_unix: started,
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+
     // Run the iroh mesh + the HTTP proxy concurrently. First error wins OR
     // a shutdown signal aborts both and we drop the engine to propagate
     // `kill_on_drop` to the SwiftLM child.
@@ -231,10 +271,15 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     let mut mesh_handle =
         tokio::spawn(async move { mtw_core::serve::run(secret, mesh_engine).await });
 
-    let proxy_cfg = upstream.map(|upstream| ProxyConfig {
+    // We always start the proxy so /status and /healthz are available; even
+    // in --mock mode with no upstream, /v1/* will simply 502, but the
+    // dashboard and health checks still work.
+    let status_for_proxy = node_status.clone();
+    let proxy_cfg = Some(ProxyConfig {
         bind: format!("127.0.0.1:{}", args.proxy_port).parse().unwrap(),
-        upstream,
+        upstream: upstream.unwrap_or_else(|| "http://127.0.0.1:0".into()),
         model_label: Some(engine.model_info().name.clone()),
+        status: status_for_proxy,
     });
     let mut proxy_handle = proxy_cfg.map(|cfg| tokio::spawn(async move { mtw_api::run(cfg).await }));
 
