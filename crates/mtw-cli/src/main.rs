@@ -328,20 +328,31 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         }
     };
 
-    // Abort both tasks; this drops their Arc<dyn InferenceEngine> clones.
+    // Abort any still-running tasks. Do NOT re-await — tokio panics if you
+    // poll a JoinHandle that already completed inside the select above.
     mesh_handle.abort();
     if let Some(h) = &proxy_handle {
         h.abort();
     }
-    let _ = mesh_handle.await;
+
+    // Give the runtime a tick to propagate the abort, so each task's future
+    // (and its Arc<dyn InferenceEngine> clone) drops.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Only .await handles that weren't polled to completion by the select.
+    if !mesh_handle.is_finished() {
+        let _ = mesh_handle.await;
+    }
     if let Some(h) = proxy_handle {
-        let _ = h.await;
+        if !h.is_finished() {
+            let _ = h.await;
+        }
     }
 
-    // Now only our `engine` Arc remains; dropping it runs SwiftLMEngine::drop
+    // Only our `engine` Arc remains now; dropping it runs SwiftLMEngine::drop
     // which kills the child thanks to Command::kill_on_drop(true).
     drop(engine);
-    // Small grace period for the child to receive SIGKILL and exit.
+    // Grace period for the child to receive SIGKILL and exit.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     result
 }

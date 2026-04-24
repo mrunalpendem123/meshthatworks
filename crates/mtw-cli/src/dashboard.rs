@@ -333,7 +333,7 @@ async fn handle_key(
             s.show_help_overlay = !s.show_help_overlay;
             return false;
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::Right => {
             let mut s = state.lock().await;
             if let Some(t) = s.tab {
                 let i = (t.index() + 1) % Tab::ORDER.len();
@@ -341,7 +341,7 @@ async fn handle_key(
             }
             return false;
         }
-        KeyCode::BackTab => {
+        KeyCode::BackTab | KeyCode::Left => {
             let mut s = state.lock().await;
             if let Some(t) = s.tab {
                 let i = (t.index() + Tab::ORDER.len() - 1) % Tab::ORDER.len();
@@ -905,7 +905,7 @@ fn render_footer(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
     ]);
 
     let hints = Line::from(vec![
-        Span::styled("  Tab", Style::default().fg(ACCENT)),
+        Span::styled("  ← → / Tab", Style::default().fg(ACCENT)),
         Span::styled(" switch  ", Style::default().fg(MUTED)),
         Span::styled("?", Style::default().fg(ACCENT)),
         Span::styled(" help  ", Style::default().fg(MUTED)),
@@ -1307,7 +1307,7 @@ fn render_tab_help(f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(block, area);
 
     let rows: Vec<(&str, &str)> = vec![
-        ("Tab / Shift-Tab", "cycle tabs"),
+        ("← / → or Tab / Shift-Tab", "cycle tabs  (works inside Chat too)"),
         ("1 / 2 / 3 / 4 / 5", "jump to Dashboard / Chat / Peers / Models / Help"),
         ("Enter (Chat)", "send prompt"),
         ("Ctrl-L (Chat)", "clear chat history"),
