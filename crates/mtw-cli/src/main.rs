@@ -68,12 +68,13 @@ enum Command {
     },
     /// List peers saved at ~/.mtw/peers.json.
     Peers,
-    /// Send a single chat completion to a running server (SwiftLM or mtw-api).
+    /// Send a single chat completion to a running server (SwiftLM or mtw-api),
+    /// or delegate to a paired peer over iroh (`mtw/infer/0`).
     Chat {
         /// Prompt text. Combine multiple words without quoting.
         #[arg(trailing_var_arg = true, required = true)]
         prompt: Vec<String>,
-        /// Base URL of the server.
+        /// Base URL of the local server (ignored when --peer is set).
         #[arg(long, default_value = "http://127.0.0.1:9337")]
         url: String,
         /// Max tokens to generate.
@@ -85,6 +86,13 @@ enum Command {
         /// Optional path to the model directory for populating model info.
         #[arg(long)]
         model_dir: Option<PathBuf>,
+        /// Ask a paired peer (by endpoint id) to answer instead of hitting
+        /// the local server. Uses the `mtw/infer/0` iroh protocol.
+        #[arg(long)]
+        peer: Option<String>,
+        /// Seconds to wait for the peer's reply before giving up.
+        #[arg(long, default_value_t = 600)]
+        peer_timeout: u64,
     },
 }
 
@@ -153,7 +161,16 @@ async fn main() -> anyhow::Result<()> {
             max_tokens,
             temperature,
             model_dir,
-        } => chat_cmd(prompt.join(" "), url, max_tokens, temperature, model_dir).await,
+            peer,
+            peer_timeout,
+        } => {
+            let joined = prompt.join(" ");
+            if let Some(peer_id) = peer {
+                chat_via_peer_cmd(&peer_id, joined, max_tokens, temperature, peer_timeout).await
+            } else {
+                chat_cmd(joined, url, max_tokens, temperature, model_dir).await
+            }
+        }
     }
 }
 
@@ -294,6 +311,55 @@ fn peers_cmd() -> anyhow::Result<()> {
     for peer in &list.peers {
         println!("  {}  (paired at unix {})", peer.id, peer.paired_at);
     }
+    Ok(())
+}
+
+async fn chat_via_peer_cmd(
+    peer_id_str: &str,
+    prompt: String,
+    max_tokens: usize,
+    temperature: f32,
+    timeout_secs: u64,
+) -> anyhow::Result<()> {
+    use iroh::{Endpoint, EndpointId, endpoint::presets};
+    use mtw_engine::{ChatMessage, ChatRequest};
+    use std::time::Duration;
+
+    let peer_id: EndpointId = peer_id_str
+        .parse()
+        .with_context(|| format!("parse peer id {peer_id_str:?}"))?;
+    let secret = mtw_core::identity::load_or_create()?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .secret_key(secret)
+        .bind()
+        .await
+        .context("bind iroh endpoint")?;
+
+    eprintln!("asking peer {peer_id} (iroh mtw/infer/0)");
+
+    let req = ChatRequest {
+        messages: vec![ChatMessage::user(prompt)],
+        max_tokens: Some(max_tokens),
+        temperature: Some(temperature),
+    };
+    let resp = mtw_core::infer::infer_on_peer(
+        &endpoint,
+        peer_id,
+        req,
+        Duration::from_secs(timeout_secs),
+    )
+    .await?;
+
+    println!("{}", resp.content);
+    eprintln!();
+    eprintln!(
+        "  [{} prompt + {} completion tokens in {}ms ≈ {:.2} tok/s via peer]",
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        resp.latency_ms,
+        resp.completion_tokens as f64 / (resp.latency_ms as f64 / 1000.0).max(0.01),
+    );
+    endpoint.close().await;
     Ok(())
 }
 

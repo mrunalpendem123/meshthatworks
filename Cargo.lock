@@ -2026,6 +2026,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "iroh",
  "mtw-api",
  "mtw-core",
  "mtw-engine",

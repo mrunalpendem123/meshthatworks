@@ -11,6 +11,7 @@ use iroh::{Endpoint, SecretKey, endpoint::presets, protocol::Router};
 use mtw_engine::InferenceEngine;
 
 use crate::health::{HEALTH_ALPN, HealthHandler};
+use crate::infer::{INFER_ALPN, InferHandler};
 
 pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow::Result<()> {
     let info = engine.model_info().clone();
@@ -30,6 +31,7 @@ pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow:
                 model_info: info.clone(),
             },
         )
+        .accept(INFER_ALPN, InferHandler::new(engine.clone()))
         .spawn();
 
     let peer_count = crate::peers::load()
@@ -42,7 +44,11 @@ pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow:
     println!("layers:      {}", info.num_layers);
     println!("peers known: {peer_count}");
     println!();
-    println!("ALPNs:       {}", std::str::from_utf8(HEALTH_ALPN).unwrap());
+    println!(
+        "ALPNs:       {}, {}",
+        std::str::from_utf8(HEALTH_ALPN).unwrap(),
+        std::str::from_utf8(INFER_ALPN).unwrap(),
+    );
     println!("press ctrl-c to stop.");
 
     tokio::signal::ctrl_c()
