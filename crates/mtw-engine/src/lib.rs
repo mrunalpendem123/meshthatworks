@@ -1,15 +1,17 @@
 //! Per-node inference engine for MeshThatWorks.
 //!
 //! Defines the [`InferenceEngine`] trait that every per-node engine must implement,
-//! plus a deterministic [`MockEngine`] for mesh development. When the MLX FFI lands,
-//! an `MlxEngine` will plug in behind the same trait without any change to callers.
+//! plus a deterministic [`MockEngine`] for mesh development and a [`SwiftLMEngine`]
+//! that talks to a local SharpAI SwiftLM process over its OpenAI-compatible HTTP API.
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 pub mod mock;
+pub mod swiftlm;
 
 pub use mock::MockEngine;
+pub use swiftlm::SwiftLMEngine;
 
 /// Activation tensor flowing through the mesh.
 ///
@@ -49,15 +51,72 @@ pub struct ModelInfo {
     pub num_experts_per_tok: Option<usize>,
 }
 
-/// Run one transformer layer at a time. A mesh coordinator calls this on the
-/// engine that owns each layer, passing activations between peers over iroh.
+/// A single chat message in OpenAI-compatible format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatMessage {
+    pub role: String,
+    pub content: String,
+}
+
+impl ChatMessage {
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".into(),
+            content: content.into(),
+        }
+    }
+
+    pub fn assistant(content: impl Into<String>) -> Self {
+        Self {
+            role: "assistant".into(),
+            content: content.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ChatRequest {
+    pub messages: Vec<ChatMessage>,
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    #[serde(default)]
+    pub temperature: Option<f32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatResponse {
+    pub content: String,
+    pub prompt_tokens: usize,
+    pub completion_tokens: usize,
+    pub latency_ms: u128,
+}
+
+/// The per-node inference engine. Implementations:
+/// - [`MockEngine`] — deterministic stand-in, useful for mesh development and tests.
+/// - [`SwiftLMEngine`] — drives a local SwiftLM process over its OpenAI-compatible API.
+/// - Future `LayerSplitEngine` will route per-layer forward passes across peers.
 #[async_trait]
 pub trait InferenceEngine: Send + Sync {
     fn model_info(&self) -> &ModelInfo;
 
+    /// Whole-model chat completion. This is the path SwiftLM natively exposes.
+    async fn chat_complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse>;
+
+    /// Per-layer forward pass. Optional — engines that only expose whole-model
+    /// generation (like SwiftLM via HTTP) return an error here. `LayerSplitEngine`
+    /// and `MockEngine` implement it for mesh coordination work.
     async fn run_layer(
         &self,
-        layer_idx: usize,
-        activations: ActivationTensor,
-    ) -> anyhow::Result<ActivationTensor>;
+        _layer_idx: usize,
+        _activations: ActivationTensor,
+    ) -> anyhow::Result<ActivationTensor> {
+        anyhow::bail!("run_layer is not supported by this engine")
+    }
 }

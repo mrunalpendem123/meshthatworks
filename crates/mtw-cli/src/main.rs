@@ -1,7 +1,8 @@
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use mtw_engine::{InferenceEngine, MockEngine};
+use mtw_engine::{ChatMessage, ChatRequest, InferenceEngine, MockEngine, SwiftLMEngine};
 
 #[derive(Parser)]
 #[command(
@@ -32,6 +33,24 @@ enum Command {
     },
     /// List peers saved at ~/.mtw/peers.json.
     Peers,
+    /// Send a single chat completion to a running SwiftLM server.
+    Chat {
+        /// Prompt text. Combine multiple words without quoting.
+        #[arg(trailing_var_arg = true, required = true)]
+        prompt: Vec<String>,
+        /// Base URL of the SwiftLM server.
+        #[arg(long, default_value = "http://127.0.0.1:9876")]
+        url: String,
+        /// Max tokens to generate.
+        #[arg(long, default_value_t = 120)]
+        max_tokens: usize,
+        /// Sampling temperature.
+        #[arg(long, default_value_t = 0.7)]
+        temperature: f32,
+        /// Optional path to the model directory, used for populating model info.
+        #[arg(long)]
+        model_dir: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -82,6 +101,13 @@ async fn main() -> anyhow::Result<()> {
             mtw_core::pair::join(secret, &invite).await
         }
         Command::Peers => peers_cmd(),
+        Command::Chat {
+            prompt,
+            url,
+            max_tokens,
+            temperature,
+            model_dir,
+        } => chat_cmd(prompt.join(" "), url, max_tokens, temperature, model_dir).await,
     }
 }
 
@@ -97,3 +123,36 @@ fn peers_cmd() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+async fn chat_cmd(
+    prompt: String,
+    url: String,
+    max_tokens: usize,
+    temperature: f32,
+    model_dir: Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let engine = SwiftLMEngine::attach(&url, model_dir.as_deref()).await?;
+    let info = engine.model_info();
+    eprintln!("connected to SwiftLM at {url}");
+    eprintln!("model: {} (layers={}, hidden={})", info.name, info.num_layers, info.hidden_size);
+    eprintln!();
+
+    let req = ChatRequest {
+        messages: vec![ChatMessage::user(prompt)],
+        max_tokens: Some(max_tokens),
+        temperature: Some(temperature),
+    };
+    let resp = engine.chat_complete(req).await?;
+
+    println!("{}", resp.content);
+    eprintln!();
+    eprintln!(
+        "  [{} prompt + {} completion tokens in {}ms ≈ {:.2} tok/s]",
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        resp.latency_ms,
+        resp.completion_tokens as f64 / (resp.latency_ms as f64 / 1000.0).max(0.01),
+    );
+    Ok(())
+}
+

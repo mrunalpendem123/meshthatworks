@@ -6,9 +6,11 @@
 //! `1 + 2 + … + N = N(N+1)/2`. Tests assert that exact sum to prove every
 //! expected layer actually ran, in order.
 
+use std::time::Instant;
+
 use async_trait::async_trait;
 
-use crate::{ActivationTensor, InferenceEngine, ModelInfo};
+use crate::{ActivationTensor, ChatRequest, ChatResponse, InferenceEngine, ModelInfo};
 
 pub struct MockEngine {
     info: ModelInfo,
@@ -35,6 +37,22 @@ impl MockEngine {
 impl InferenceEngine for MockEngine {
     fn model_info(&self) -> &ModelInfo {
         &self.info
+    }
+
+    async fn chat_complete(&self, req: ChatRequest) -> anyhow::Result<ChatResponse> {
+        let t0 = Instant::now();
+        let last = req
+            .messages
+            .last()
+            .map(|m| m.content.as_str())
+            .unwrap_or("");
+        let content = format!("[mock reply] echo: {}", last.chars().take(200).collect::<String>());
+        Ok(ChatResponse {
+            prompt_tokens: req.messages.iter().map(|m| m.content.len() / 4).sum(),
+            completion_tokens: content.len() / 4,
+            content,
+            latency_ms: t0.elapsed().as_millis(),
+        })
     }
 
     async fn run_layer(
@@ -67,6 +85,7 @@ impl InferenceEngine for MockEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ChatMessage;
 
     #[tokio::test]
     async fn single_layer_bumps_by_one() {
@@ -123,5 +142,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out.data, vec![1.0; 8]);
+    }
+
+    #[tokio::test]
+    async fn chat_complete_echoes() {
+        let engine = MockEngine::olmoe();
+        let req = ChatRequest {
+            messages: vec![ChatMessage::user("hi there")],
+            max_tokens: Some(64),
+            temperature: Some(0.7),
+        };
+        let r = engine.chat_complete(req).await.unwrap();
+        assert!(r.content.contains("hi there"));
+        assert!(r.completion_tokens > 0);
     }
 }
