@@ -1,0 +1,21 @@
+diff --git a/Libraries/MLXLLM/Models/Qwen3MoE.swift b/Libraries/MLXLLM/Models/Qwen3MoE.swift
+index c5b53fc..913c9ef 100644
+--- a/Libraries/MLXLLM/Models/Qwen3MoE.swift
++++ b/Libraries/MLXLLM/Models/Qwen3MoE.swift
+@@ -120,7 +120,15 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+ 
+     init(_ args: Qwen3MoEConfiguration) {
+         self.numExperts = args.numExperts
+-        self.topK = args.numExpertsPerToken
++        self.topK = {
++            if let override = ProcessInfo.processInfo.environment["SWIFTLM_TOP_K"],
++               let k = Int(override), k > 0 {
++                let effective = min(k, args.numExpertsPerToken)
++                print("[SwiftLM] Top-K override: \(args.numExpertsPerToken) -> \(effective)")
++                return effective
++            }
++            return args.numExpertsPerToken
++        }()
+         self.normTopkProb = args.normTopkProb
+ 
+         _gate.wrappedValue = Linear(args.hiddenSize, numExperts, bias: false)

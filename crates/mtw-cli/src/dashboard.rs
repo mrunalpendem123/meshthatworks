@@ -723,60 +723,70 @@ async fn stream_chat(
     let mut buf = String::new();
     let mut tokens: usize = 0;
 
-    let process_frame = |buf: &mut String,
-                         tokens: &mut usize,
-                         state: &Arc<Mutex<SharedState>>|
-     -> Option<bool> {
-        // Accept both \n\n and \r\n\r\n delimiters.
-        let mut idx = buf.find("\n\n");
-        if idx.is_none() {
-            idx = buf.find("\r\n\r\n").map(|i| i + 2);
-        }
-        let Some(i) = idx else {
-            return None;
-        };
-        let frame: String = buf.drain(..=i + 1).collect();
-        for line in frame.lines() {
-            let line = line.trim_end_matches('\r');
-            let Some(payload) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
-                continue;
-            };
-            let payload = payload.trim();
-            if payload.is_empty() {
-                continue;
+    // Accumulate deltas from every parseable line in a frame, then take the
+    // state lock ONCE per frame to apply them — instead of `tokio::spawn`
+    // per token, which (a) costs a task allocation per token and (b) loses
+    // ordering when multiple spawns race for the lock.
+    let mut apply = |frame_deltas: &str, state: &Arc<Mutex<SharedState>>| -> futures_util::future::BoxFuture<'_, ()> {
+        let s = state.clone();
+        let owned = frame_deltas.to_string();
+        Box::pin(async move {
+            if owned.is_empty() {
+                return;
             }
-            if payload == "[DONE]" {
-                return Some(true);
+            let mut st = s.lock().await;
+            if let Some(last) = st.chat.last_mut() {
+                last.content.push_str(&owned);
             }
-            let v: Value = match serde_json::from_str(payload) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
-                *tokens += 1;
-                let delta = delta.to_string();
-                let state = state.clone();
-                tokio::spawn(async move {
-                    let mut s = state.lock().await;
-                    if let Some(last) = s.chat.last_mut() {
-                        last.content.push_str(&delta);
-                    }
-                });
-            }
-        }
-        Some(false)
+        })
     };
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.context("read chunk")?;
         buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(done) = process_frame(&mut buf, &mut tokens, &state) {
+
+        loop {
+            // Find the next SSE event boundary: \n\n or \r\n\r\n.
+            let mut idx = buf.find("\n\n");
+            if idx.is_none() {
+                idx = buf.find("\r\n\r\n").map(|i| i + 2);
+            }
+            let Some(i) = idx else { break };
+            let frame: String = buf.drain(..=i + 1).collect();
+
+            let mut frame_deltas = String::new();
+            let mut done = false;
+            for line in frame.lines() {
+                let line = line.trim_end_matches('\r');
+                let Some(payload) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
+                    continue;
+                };
+                let payload = payload.trim();
+                if payload.is_empty() {
+                    continue;
+                }
+                if payload == "[DONE]" {
+                    done = true;
+                    break;
+                }
+                let v: Value = match serde_json::from_str(payload) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
+                    tokens += 1;
+                    frame_deltas.push_str(delta);
+                }
+            }
+            apply(&frame_deltas, &state).await;
             if done {
                 return Ok(tokens);
             }
         }
     }
-    // Flush any trailing line even without final \n\n.
+
+    // Flush trailing line even without final \n\n.
+    let mut frame_deltas = String::new();
     for line in buf.lines() {
         let line = line.trim();
         let Some(payload) = line.strip_prefix("data: ").or_else(|| line.strip_prefix("data:")) else {
@@ -789,17 +799,11 @@ async fn stream_chat(
         if let Ok(v) = serde_json::from_str::<Value>(payload) {
             if let Some(delta) = v["choices"][0]["delta"]["content"].as_str() {
                 tokens += 1;
-                let delta = delta.to_string();
-                let state = state.clone();
-                tokio::spawn(async move {
-                    let mut s = state.lock().await;
-                    if let Some(last) = s.chat.last_mut() {
-                        last.content.push_str(&delta);
-                    }
-                });
+                frame_deltas.push_str(delta);
             }
         }
     }
+    apply(&frame_deltas, &state).await;
     Ok(tokens)
 }
 

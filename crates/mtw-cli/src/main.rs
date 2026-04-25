@@ -56,6 +56,15 @@ enum Command {
         /// Attach to an already-running SwiftLM at this URL instead of spawning.
         #[arg(long, conflicts_with_all = &["mock", "swiftlm"])]
         attach: Option<String>,
+        /// Optional draft model directory for speculative decoding (e.g.
+        /// Qwen3-0.6B-4bit). Pairs a tiny draft with the main model so the
+        /// big model verifies N draft tokens in one parallel pass — typical
+        /// 1.5–3× speedup when the draft accepts well, at ~400 MB extra RAM.
+        #[arg(long)]
+        draft_model: Option<PathBuf>,
+        /// Number of draft tokens per speculation round (only when --draft-model is set).
+        #[arg(long, default_value_t = 4)]
+        num_draft_tokens: u32,
     },
     /// Show local info and ping every paired peer.
     Status,
@@ -144,6 +153,8 @@ async fn main() -> anyhow::Result<()> {
             mem_limit,
             mock,
             attach,
+            draft_model,
+            num_draft_tokens,
         } => {
             serve_cmd(ServeArgs {
                 model,
@@ -153,6 +164,8 @@ async fn main() -> anyhow::Result<()> {
                 mem_limit,
                 mock,
                 attach,
+                draft_model,
+                num_draft_tokens,
             })
             .await
         }
@@ -211,6 +224,8 @@ struct ServeArgs {
     mem_limit: u32,
     mock: bool,
     attach: Option<String>,
+    draft_model: Option<PathBuf>,
+    num_draft_tokens: u32,
 }
 
 async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
@@ -238,11 +253,19 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         println!("  binary: {}", args.swiftlm.display());
         println!("  model:  {}", args.model.display());
         println!("  port:   {}", args.swiftlm_port);
+        if let Some(d) = &args.draft_model {
+            println!("  draft:  {} ({} tokens/round)", d.display(), args.num_draft_tokens);
+        }
         let mut opts = SwiftLMOptions::new(&args.swiftlm, &args.model);
         opts.port = args.swiftlm_port;
         opts.mem_limit_mb = Some(args.mem_limit);
         opts.stream_experts = true;
         opts.ssd_prefetch = true;
+        if let Some(d) = args.draft_model.clone() {
+            opts.draft_model_dir = Some(d);
+            opts.extra_args.push("--num-draft-tokens".into());
+            opts.extra_args.push(args.num_draft_tokens.to_string());
+        }
         let engine = SwiftLMEngine::spawn(opts)
             .await
             .context("spawn SwiftLM")?;
