@@ -107,12 +107,22 @@ impl SwiftLMEngine {
             .to_path_buf();
 
         tracing::info!(binary = %opts.binary.display(), port = opts.port, "spawning SwiftLM");
+        // Pipe SwiftLM's stdout/stderr into a log file so it's debuggable.
+        // Override path with MTW_SWIFTLM_LOG.
+        let log_path = std::env::var("MTW_SWIFTLM_LOG")
+            .unwrap_or_else(|_| "/tmp/mtw-swiftlm.log".into());
+        let stdout_log = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+            .with_context(|| format!("open SwiftLM log {log_path}"))?;
+        let stderr_log = stdout_log.try_clone()?;
         let child = Command::new(&opts.binary)
             .args(&args)
             .current_dir(&binary_dir)
             .kill_on_drop(true)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stdout(std::process::Stdio::from(stdout_log))
+            .stderr(std::process::Stdio::from(stderr_log))
             .spawn()
             .with_context(|| format!("spawn {}", opts.binary.display()))?;
 
