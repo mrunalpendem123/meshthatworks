@@ -52,6 +52,8 @@ use ratatui::{
 use serde_json::Value;
 use tokio::sync::Mutex;
 
+use crate::catalog::{CATALOG, CatalogModel, Category, Compat};
+
 // ---------------------------------------------------------- palette
 
 const ACCENT: Color = Color::Rgb(115, 192, 222); // soft cyan
@@ -151,6 +153,17 @@ enum Overlay {
         error: Option<String>,
         in_flight: bool,
     },
+    DeleteConfirm {
+        dir_name: String,
+        size_bytes: u64,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct InstalledModel {
+    pub dir_name: String,
+    pub abs_path: std::path::PathBuf,
+    pub size_bytes: u64,
 }
 
 impl Default for Overlay {
@@ -174,6 +187,11 @@ struct SharedState {
 
     models: Vec<ModelRow>,
     models_error: Option<String>,
+
+    installed: Vec<InstalledModel>,
+    /// Index into a flat (installed ++ filtered_catalog) list for selection
+    models_cursor: usize,
+    models_filter: Category,
 
     chat: Vec<ChatTurn>,
     input: String,
@@ -210,6 +228,9 @@ impl SharedState {
             peer_health: self.peer_health.clone(),
             models: self.models.clone(),
             models_error: self.models_error.clone(),
+            installed: self.installed.clone(),
+            models_cursor: self.models_cursor,
+            models_filter: self.models_filter,
             chat: self.chat.clone(),
             input: self.input.clone(),
             streaming: self.streaming,
@@ -344,6 +365,7 @@ async fn handle_key(
             Overlay::Help => 1,
             Overlay::Pair { .. } => 2,
             Overlay::Join { .. } => 3,
+            Overlay::DeleteConfirm { .. } => 4,
         };
         (s.tab == Some(Tab::Chat), kind != 0, kind)
     };
@@ -355,6 +377,19 @@ async fn handle_key(
         }
         if matches!(key.code, KeyCode::Esc) {
             state.lock().await.overlay = Overlay::None;
+            return false;
+        }
+        // DeleteConfirm overlay: Y confirms, N cancels.
+        if overlay_kind == 4 {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    confirm_delete(state.clone()).await;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Enter => {
+                    state.lock().await.overlay = Overlay::None;
+                }
+                _ => {}
+            }
             return false;
         }
         match overlay_kind {
@@ -430,6 +465,65 @@ async fn handle_key(
             return false;
         }
         _ => {}
+    }
+
+    // Models-tab actions
+    let in_models = state.lock().await.tab == Some(Tab::Models);
+    if in_models {
+        match key.code {
+            KeyCode::Up => {
+                let mut s = state.lock().await;
+                s.models_cursor = s.models_cursor.saturating_sub(1);
+                return false;
+            }
+            KeyCode::Down => {
+                let mut s = state.lock().await;
+                let avail = CATALOG.iter().filter(|m| m.matches(s.models_filter)).count();
+                let total = s.installed.len() + avail;
+                if total > 0 {
+                    s.models_cursor = (s.models_cursor + 1).min(total - 1);
+                }
+                return false;
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') => {
+                let s = state.lock().await;
+                if s.models_cursor < s.installed.len() {
+                    let m = &s.installed[s.models_cursor];
+                    let dir_name = m.dir_name.clone();
+                    let size_bytes = m.size_bytes;
+                    drop(s);
+                    state.lock().await.overlay = Overlay::DeleteConfirm {
+                        dir_name,
+                        size_bytes,
+                    };
+                }
+                return false;
+            }
+            KeyCode::Enter => {
+                let s = state.lock().await;
+                let avail: Vec<&CatalogModel> =
+                    CATALOG.iter().filter(|m| m.matches(s.models_filter)).collect();
+                let cursor_in_avail = s.models_cursor.checked_sub(s.installed.len());
+                if let Some(idx) = cursor_in_avail {
+                    if let Some(m) = avail.get(idx) {
+                        let repo = m.hf_repo;
+                        let dir = m.dir_name;
+                        drop(s);
+                        let mut s = state.lock().await;
+                        s.push_activity(
+                            ActivityKind::Info,
+                            format!("install: {} → ~/Desktop/meshthatworks-deps/models/{}", repo, dir),
+                        );
+                        s.push_activity(
+                            ActivityKind::Info,
+                            "(in-TUI download not built yet — see Help for the curl command)",
+                        );
+                    }
+                }
+                return false;
+            }
+            _ => {}
+        }
     }
 
     // Peers-tab actions: P to pair, J to join.
@@ -569,6 +663,54 @@ async fn start_pair(state: Arc<Mutex<SharedState>>) {
             }
         }
     });
+}
+
+async fn confirm_delete(state: Arc<Mutex<SharedState>>) {
+    let dir_name = {
+        let s = state.lock().await;
+        match &s.overlay {
+            Overlay::DeleteConfirm { dir_name, .. } => dir_name.clone(),
+            _ => return,
+        }
+    };
+    let home = match std::env::var_os("HOME") {
+        Some(h) => h,
+        None => return,
+    };
+    let path = std::path::Path::new(&home)
+        .join("Desktop/meshthatworks-deps/models")
+        .join(&dir_name);
+    let result = tokio::task::spawn_blocking({
+        let path = path.clone();
+        move || std::fs::remove_dir_all(&path)
+    })
+    .await;
+    let mut s = state.lock().await;
+    match result {
+        Ok(Ok(())) => {
+            s.installed.retain(|m| m.dir_name != dir_name);
+            if s.models_cursor >= s.installed.len() + CATALOG.len() {
+                s.models_cursor = s.installed.len().saturating_sub(1);
+            }
+            s.push_activity(
+                ActivityKind::Ok,
+                format!("deleted {}", dir_name),
+            );
+        }
+        Ok(Err(e)) => {
+            s.push_activity(
+                ActivityKind::Err,
+                format!("delete {} failed: {}", dir_name, e),
+            );
+        }
+        Err(e) => {
+            s.push_activity(
+                ActivityKind::Err,
+                format!("delete task panicked: {}", e),
+            );
+        }
+    }
+    s.overlay = Overlay::None;
 }
 
 async fn submit_join(state: Arc<Mutex<SharedState>>) {
@@ -884,6 +1026,33 @@ async fn refresh_loop(
             }
         }
 
+        // installed models on disk
+        if let Some(home) = std::env::var_os("HOME") {
+            let dir = std::path::Path::new(&home)
+                .join("Desktop/meshthatworks-deps/models");
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                let mut found: Vec<InstalledModel> = Vec::new();
+                for e in entries.flatten() {
+                    let path = e.path();
+                    if !path.is_dir() {
+                        continue;
+                    }
+                    let dir_name = match path.file_name().and_then(|s| s.to_str()) {
+                        Some(s) => s.to_string(),
+                        None => continue,
+                    };
+                    let size = du(&path).unwrap_or(0);
+                    found.push(InstalledModel {
+                        dir_name,
+                        abs_path: path,
+                        size_bytes: size,
+                    });
+                }
+                found.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+                state.lock().await.installed = found;
+            }
+        }
+
         // peers.json
         match mtw_core::peers::load() {
             Ok(PeerList { peers }) => {
@@ -996,6 +1165,9 @@ fn render(f: &mut ratatui::Frame, s: &SharedState) {
         }
         Overlay::Join { input, status, error, in_flight } => {
             render_join_overlay(f, area, input, status, error.as_deref(), *in_flight, s.spinner_frame);
+        }
+        Overlay::DeleteConfirm { dir_name, size_bytes } => {
+            render_delete_overlay(f, area, dir_name, *size_bytes);
         }
     }
 }
@@ -1492,48 +1664,183 @@ fn render_tab_peers(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
 // ---------------------------------------------------------- tab: models
 
 fn render_tab_models(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
-    let block = rounded_block(" Models ");
-    let inner = block.inner(area);
-    f.render_widget(block, area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3), // filter bar
+            Constraint::Min(8),    // body
+        ])
+        .split(area);
 
-    let mut lines = vec![
-        Line::from(Span::styled(
-            format!("  {:<3}  {:<60}  {}", "#", "id", "owned_by"),
-            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-    ];
-    if let Some(err) = &s.models_error {
-        lines.push(Line::from(Span::styled(
-            format!("  error: {}", truncate(err.clone(), 80)),
-            Style::default().fg(ERR),
-        )));
+    // ---- filter bar
+    let filter_block = rounded_block(" Filter by use case (←/→) ");
+    let inner = filter_block.inner(rows[0]);
+    f.render_widget(filter_block, rows[0]);
+    let mut spans: Vec<Span> = Vec::new();
+    for (i, c) in Category::FILTERS.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("  ·  ", Style::default().fg(ACCENT_DIM)));
+        }
+        let style = if *c == s.models_filter {
+            Style::default()
+                .fg(ACCENT)
+                .add_modifier(Modifier::BOLD)
+                .bg(BG_ALT)
+        } else {
+            Style::default().fg(MUTED)
+        };
+        spans.push(Span::styled(format!(" {} ", c.label()), style));
     }
-    if s.models.is_empty() && s.models_error.is_none() {
+    f.render_widget(
+        Paragraph::new(Line::from(spans)),
+        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+    );
+
+    // ---- body: installed first, then catalog filtered
+    let total_disk: u64 = s.installed.iter().map(|i| i.size_bytes).sum();
+    let body_title = format!(
+        " Installed ({}, {}) · Available ({}) ",
+        s.installed.len(),
+        format_size(total_disk),
+        CATALOG.iter().filter(|m| m.matches(s.models_filter)).count(),
+    );
+    let body_block = rounded_block(&body_title);
+    let body_inner = body_block.inner(rows[1]);
+    f.render_widget(body_block, rows[1]);
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    // installed section
+    lines.push(Line::from(Span::styled(
+        "  ▎ INSTALLED",
+        Style::default().fg(OK).add_modifier(Modifier::BOLD),
+    )));
+    if s.installed.is_empty() {
         lines.push(Line::from(Span::styled(
-            format!("  {} fetching /v1/models…", spinner_char(s.spinner_frame)),
+            "  (none — pull a model from the Available list below)",
             Style::default().fg(MUTED),
         )));
+    } else {
+        let installed_idx_end = s.installed.len();
+        for (i, m) in s.installed.iter().enumerate() {
+            let is_selected = i == s.models_cursor;
+            let prefix = if is_selected {
+                Span::styled(
+                    "  ▶ ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("    ")
+            };
+            let active = s
+                .node
+                .as_ref()
+                .map(|n| n.model.name == m.dir_name)
+                .unwrap_or(false);
+            let active_tag = if active {
+                Span::styled(
+                    "  [active]",
+                    Style::default().fg(OK).add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw("")
+            };
+            lines.push(Line::from(vec![
+                prefix,
+                Span::styled(
+                    format!("{:<48}", truncate(m.dir_name.clone(), 48)),
+                    Style::default().fg(FG),
+                ),
+                Span::styled(
+                    format!(" {:>9}", format_size(m.size_bytes)),
+                    Style::default().fg(MUTED),
+                ),
+                active_tag,
+            ]));
+        }
+        let _ = installed_idx_end; // marker for future selection-aware code
     }
-    for (i, m) in s.models.iter().enumerate() {
-        lines.push(Line::from(vec![
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ▎ AVAILABLE (curated MoE catalog)",
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+    )));
+    let filtered: Vec<&CatalogModel> = CATALOG.iter().filter(|m| m.matches(s.models_filter)).collect();
+    let cursor_in_avail = s.models_cursor.checked_sub(s.installed.len());
+    for (i, m) in filtered.iter().enumerate() {
+        let installed = s.installed.iter().any(|inst| inst.dir_name == m.dir_name);
+        let is_selected = cursor_in_avail.map(|c| c == i).unwrap_or(false);
+        let prefix = if is_selected {
             Span::styled(
-                format!("  {:<3}  ", i + 1),
+                "  ▶ ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::raw("    ")
+        };
+        let installed_tag = if installed {
+            Span::styled(
+                "  [installed]",
+                Style::default().fg(OK),
+            )
+        } else {
+            Span::raw("")
+        };
+        let compat_color = match m.compat {
+            Compat::Recommended => OK,
+            Compat::Tight => WARN,
+            Compat::NeedsBigger => MUTED,
+            Compat::UnsupportedArch | Compat::Blocked => ERR,
+        };
+        lines.push(Line::from(vec![
+            prefix,
+            Span::styled(
+                format!("{:<28}", truncate(m.name.into(), 28)),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" {:>8}", format!("{:.1} GB", m.size_gb)),
                 Style::default().fg(MUTED),
             ),
             Span::styled(
-                format!("{:<60}", truncate(m.id.clone(), 60)),
-                Style::default().fg(FG),
+                format!(" · {}", m.compat.label()),
+                Style::default().fg(compat_color),
             ),
+            installed_tag,
+        ]));
+        // categories + note
+        let cats: Vec<&str> = m.categories.iter().map(|c| c.label()).collect();
+        lines.push(Line::from(vec![
+            Span::raw("        "),
             Span::styled(
-                format!("  {}", m.owned_by),
+                format!("{}  ·  {}", cats.join(", "), m.note),
                 Style::default().fg(MUTED),
             ),
         ]));
     }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "  ↑/↓ select   D delete (installed only)   ←/→ filter   Enter copy install command",
+        Style::default().fg(MUTED),
+    )));
+
+    // Keep a window of lines that fits.
+    let h = body_inner.height as usize;
+    let cursor_pos = s.models_cursor;
+    let estimated_line = if cursor_pos < s.installed.len() {
+        cursor_pos + 1
+    } else {
+        s.installed.len() + 3 + (cursor_pos - s.installed.len()) * 2
+    };
+    let start = estimated_line.saturating_sub(h.saturating_sub(2));
+    let end = (start + h).min(lines.len());
+    let lines = lines[start..end].to_vec();
+
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
-        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+        body_inner.inner(Margin { horizontal: 1, vertical: 0 }),
     );
 }
 
@@ -1584,6 +1891,71 @@ fn render_tab_help(f: &mut ratatui::Frame, area: Rect) {
     lines.push(Line::from(
         "  - Chat streams over the local :9337 proxy, which forwards to SwiftLM.",
     ));
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+    );
+}
+
+fn render_delete_overlay(
+    f: &mut ratatui::Frame,
+    area: Rect,
+    dir_name: &str,
+    size_bytes: u64,
+) {
+    let w = 80;
+    let h = 11;
+    let r = center_rect(area, w, h);
+    f.render_widget(Clear, r);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(ERR))
+        .title(Span::styled(
+            " Delete model ",
+            Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+        ));
+    let inner = block.inner(r);
+    f.render_widget(block, r);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "  This will remove the model directory and free disk space:",
+            Style::default().fg(MUTED),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                dir_name.to_string(),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("   ({} on disk)", format_size(size_bytes)),
+                Style::default().fg(MUTED),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  Cannot be undone — you'd need to re-download.",
+            Style::default().fg(WARN),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("    "),
+            Span::styled(
+                "[Y]",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" delete   "),
+            Span::styled(
+                "[N / Esc]",
+                Style::default().fg(OK).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" cancel"),
+        ]),
+    ];
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
         inner.inner(Margin { horizontal: 1, vertical: 0 }),
@@ -1821,6 +2193,35 @@ fn rel_instant(i: &Option<Instant>) -> String {
                 format!("{:.0}h ago", secs / 3600.0)
             }
         }
+    }
+}
+
+/// Recursive directory size in bytes, no symlink-following.
+fn du(path: &std::path::Path) -> std::io::Result<u64> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() {
+        return Ok(0);
+    }
+    if meta.is_file() {
+        return Ok(meta.len());
+    }
+    if meta.is_dir() {
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            let e = entry?;
+            total = total.saturating_add(du(&e.path()).unwrap_or(0));
+        }
+        return Ok(total);
+    }
+    Ok(0)
+}
+
+fn format_size(bytes: u64) -> String {
+    let gb = bytes as f64 / 1e9;
+    if gb >= 1.0 {
+        format!("{:.1} GB", gb)
+    } else {
+        format!("{:.0} MB", bytes as f64 / 1e6)
     }
 }
 

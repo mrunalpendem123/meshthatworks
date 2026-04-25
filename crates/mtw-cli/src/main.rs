@@ -1,3 +1,4 @@
+mod catalog;
 mod dashboard;
 
 use std::path::PathBuf;
