@@ -2,6 +2,10 @@ import { Nav } from '@/components/Nav';
 import { Section } from '@/components/Section';
 import { Bullet } from '@/components/Bullet';
 import { Footer } from '@/components/Footer';
+import { CopyableCommand } from '@/components/CopyableCommand';
+
+const INSTALL_CMD =
+  'curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh';
 
 const REPO = 'https://github.com/mrunalpendem123/meshthatworks';
 
@@ -40,10 +44,7 @@ export default function Page() {
               <span className="mr-4 text-fg">curl</span>
               <span className="text-muted">macOS · Apple Silicon · MIT</span>
             </div>
-            <div className="px-4 py-3 text-fg select-all">
-              <span className="text-fgDim">$ </span>
-              curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
-            </div>
+            <CopyableCommand cmd={INSTALL_CMD} />
           </div>
 
           <p className="text-xs text-muted mt-3">
@@ -314,7 +315,7 @@ export default function Page() {
             <CommandLine
               num="1"
               comment="install — clones, builds, sets up ~/.local/bin/mtw"
-              cmd="curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh"
+              cmd={INSTALL_CMD}
             />
             <CommandLine
               num="2"
@@ -380,7 +381,6 @@ function CommandLine({
         # {num}. {comment}
       </div>
       <div className="bg-bgElev border border-line rounded-md px-4 py-2 text-fg select-all break-all">
-        <span className="text-fgDim">$ </span>
         {cmd}
       </div>
     </div>
