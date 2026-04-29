@@ -11,9 +11,10 @@
 #   MTW_HOME=/path           where to clone meshthatworks      (default: ~/.meshthatworks)
 #   MTW_DEPS=/path           where SwiftLM + models live       (default: ~/.meshthatworks-deps)
 #   MTW_INSTALL_DIR=/path    where the mtw binary goes         (default: ~/.local/bin)
-#   MTW_MODEL=name           Hugging Face mlx-community model  (default: OLMoE-1B-7B-0125-Instruct-4bit)
 #   MTW_SKIP_SWIFTLM=1       skip SwiftLM clone+build (advanced)
-#   MTW_SKIP_MODEL=1         skip model download (advanced)
+#
+# Models are NOT downloaded here. Pick one from the Models tab inside
+# `mtw dashboard` after install — that catalog handles the download for you.
 
 set -euo pipefail
 
@@ -21,7 +22,6 @@ REPO_URL="${MTW_REPO:-https://github.com/mrunalpendem123/meshthatworks.git}"
 SRC_DIR="${MTW_HOME:-$HOME/.meshthatworks}"
 DEPS_DIR="${MTW_DEPS:-$HOME/.meshthatworks-deps}"
 BIN_DIR="${MTW_INSTALL_DIR:-$HOME/.local/bin}"
-MODEL_NAME="${MTW_MODEL:-OLMoE-1B-7B-0125-Instruct-4bit}"
 
 # ───────────────────────────────────────────────────────── helpers
 step()  { printf "\033[1;36m==>\033[0m %s\n" "$1"; }
@@ -94,35 +94,11 @@ else
     fi
 fi
 
-# ───────────────────────────────────────────────────────── 5. starter model
-MODEL_DIR="$DEPS_DIR/models/$MODEL_NAME"
-HF_REPO="mlx-community/$MODEL_NAME"
+# Models live at $DEPS_DIR/models/<name>/. Pick one from the dashboard's
+# Models tab after install — the catalog UI handles the download.
+mkdir -p "$DEPS_DIR/models"
 
-if [ "${MTW_SKIP_MODEL:-0}" = "1" ]; then
-    warn "MTW_SKIP_MODEL=1 → not downloading a model"
-elif [ -f "$MODEL_DIR/config.json" ] && [ -f "$MODEL_DIR/model.safetensors" ]; then
-    step "Model already present at $MODEL_DIR"
-else
-    step "Downloading $MODEL_NAME (~3.6 GB, ~5–15 min)"
-    mkdir -p "$MODEL_DIR"
-    for f in config.json model.safetensors model.safetensors.index.json tokenizer.json tokenizer_config.json special_tokens_map.json generation_config.json; do
-        if [ -f "$MODEL_DIR/$f" ]; then continue; fi
-        url="https://huggingface.co/$HF_REPO/resolve/main/$f"
-        # Some files (model.safetensors.index.json, generation_config.json)
-        # may legitimately not exist for every model. Try, but tolerate 404.
-        if curl -L --fail -sS -o "$MODEL_DIR/$f.part" "$url"; then
-            mv "$MODEL_DIR/$f.part" "$MODEL_DIR/$f"
-            step "  fetched $f"
-        else
-            rm -f "$MODEL_DIR/$f.part"
-            warn "  $f not on HF (skipped — may be optional)"
-        fi
-    done
-    [ -f "$MODEL_DIR/config.json" ] && [ -f "$MODEL_DIR/model.safetensors" ] \
-        || fail "model download incomplete — re-run the script"
-fi
-
-# ───────────────────────────────────────────────────────── 6. PATH
+# ───────────────────────────────────────────────────────── 5. PATH
 case ":$PATH:" in
     *":$BIN_DIR:"*) ;;
     *)
@@ -135,14 +111,15 @@ case ":$PATH:" in
         ;;
 esac
 
-# ───────────────────────────────────────────────────────── 7. doctor + next step
+# ───────────────────────────────────────────────────────── 6. doctor + next step
 echo
 step "All set. Running mtw doctor:"
 echo
 "$BIN_DIR/mtw" doctor || true
 
 echo
-step "To start the engine + open the dashboard:"
+step "Next:"
 echo
-echo "    mtw start"
+echo "    mtw dashboard           # pick a model from the Models tab"
+echo "    mtw start               # once a model is downloaded, this opens the engine + dashboard"
 echo

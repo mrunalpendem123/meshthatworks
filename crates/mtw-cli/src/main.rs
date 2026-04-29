@@ -483,9 +483,12 @@ async fn start_cmd(args: StartArgs) -> anyhow::Result<()> {
         anyhow::bail!("missing SwiftLM");
     }
     if !args.model.is_dir() || !args.model.join("config.json").is_file() {
-        eprintln!("mtw start: model directory not found at {}", args.model.display());
+        eprintln!("mtw start: no model installed yet.");
         eprintln!();
-        eprintln!("Run  mtw doctor  for setup instructions, or pass --model <path>.");
+        eprintln!("Open the dashboard and pick one from the Models tab:");
+        eprintln!("    mtw dashboard");
+        eprintln!();
+        eprintln!("(or pass --model <path> if you already have one elsewhere.)");
         anyhow::bail!("missing model");
     }
 

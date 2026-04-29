@@ -21,7 +21,17 @@ No cloud. No accounts. Your prompts and your data stay on your machines.
 curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
 ```
 
-This installs Rust if missing, clones the repo, clones and builds [SwiftLM](https://github.com/SharpAI/SwiftLM), downloads a 3.6 GB starter model, builds `mtw`, and runs `mtw doctor` so you can see the result. You need Xcode for the SwiftLM build — the installer tells you if it is missing. First run is around 30 minutes and uses ~5 GB of disk.
+This installs Rust if missing, clones the repo, clones and builds [SwiftLM](https://github.com/SharpAI/SwiftLM), and builds `mtw`. You need Xcode for the SwiftLM build — the installer tells you if it is missing. First run is around 30 minutes and uses about 1.5 GB of disk.
+
+No model is downloaded yet — the dashboard's Models tab is the catalog.
+
+## Pick a model
+
+```
+mtw dashboard
+```
+
+Open the **Models** tab. Pick one from the catalog (small models for trying it out, big MoE models for the real use case). The dashboard handles the download.
 
 ## Run it
 

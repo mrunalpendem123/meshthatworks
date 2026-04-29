@@ -225,11 +225,36 @@ fn print_local(s: &LocalSetup) {
     if s.model_present {
         println!("✓  {}", s.model_path.display());
     } else {
-        println!(
-            "✗  no model at {}. Download with scripts/bootstrap.sh, or fetch from Hugging Face mlx-community.",
-            s.model_path.display()
-        );
+        // Look for any other model dir under ~/.meshthatworks-deps/models — the
+        // dashboard catalog might have downloaded one with a different name.
+        let other = list_other_models(&s.model_path);
+        if !other.is_empty() {
+            println!("✓  found other models — pass --model <path>");
+            for p in &other {
+                println!("                     {}", p.display());
+            }
+        } else {
+            println!("✗  no model installed yet — open `mtw dashboard` and pick one from the Models tab");
+        }
     }
+}
+
+fn list_other_models(default_path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let parent = match default_path.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return Vec::new(),
+    };
+    let Ok(rd) = std::fs::read_dir(&parent) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_dir() && path.join("config.json").is_file() {
+            out.push(path);
+        }
+    }
+    out
 }
 
 fn print_next_step(s: &LocalSetup) {
@@ -244,9 +269,9 @@ fn print_next_step(s: &LocalSetup) {
         println!("       curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh");
         return;
     }
-    if !s.model_present {
-        println!("Next: download a starter model (~3.6 GB).");
-        println!("       scripts/bootstrap.sh   # or pass --model /path/to/your-model to mtw serve");
+    if !s.model_present && list_other_models(&s.model_path).is_empty() {
+        println!("Next: pick a model.");
+        println!("       mtw dashboard          # opens the Models tab — choose one and download");
         return;
     }
     println!("Everything is set up. ✨");
