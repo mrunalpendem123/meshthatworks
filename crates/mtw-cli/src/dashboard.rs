@@ -1165,11 +1165,12 @@ async fn run_chat_turn(state: Arc<Mutex<SharedState>>, url: String) {
                 );
             }
             Err(e) => {
-                let pretty = format!("{e:#}");
+                let raw = format!("{e:#}");
+                let pretty = friendly_chat_error(&raw);
                 s.chat_error = Some(pretty.clone());
                 if let Some(last) = s.chat.last_mut() {
                     if last.role == "assistant" && last.content.is_empty() {
-                        last.content = format!("[error: {pretty}]");
+                        last.content = pretty.clone();
                     }
                 }
                 s.push_activity(ActivityKind::Err, format!("chat error: {pretty}"));
@@ -1316,7 +1317,13 @@ async fn run_agent_turn(state: Arc<Mutex<SharedState>>, url: String) {
                         }
                     }
                     Err(e) => {
-                        last_err = Some(format!("{e:#}"));
+                        let pretty = friendly_chat_error(&format!("{e:#}"));
+                        if let Some(last) = s.chat.last_mut() {
+                            if last.role == "assistant" && last.content.is_empty() {
+                                last.content = pretty.clone();
+                            }
+                        }
+                        last_err = Some(pretty);
                         break;
                     }
                 }
@@ -1544,6 +1551,26 @@ async fn execute_tool(call: &ToolCall) -> String {
             }
         }
     }
+}
+
+/// Make a chat error human-readable. Connection-refused at :9337 is the
+/// dominant case (user opened `mtw dashboard` without starting the engine);
+/// the raw `tcp connect error: Connection refused (os error 61)` is useless
+/// to a non-developer. Replace it with a clear pointer to `mtw start`.
+fn friendly_chat_error(raw: &str) -> String {
+    if raw.contains("Connection refused")
+        || raw.contains("os error 61")
+        || raw.contains("ConnectionRefused")
+    {
+        return "the engine is not running. run  mtw start  to bring it up, then try this prompt again.".into();
+    }
+    if raw.contains("timed out") || raw.contains("timeout") {
+        return format!(
+            "the engine timed out. it may be loading the model (cold start can take ~30s). try again in a moment.\n\n[underlying: {}]",
+            truncate(raw.to_string(), 200)
+        );
+    }
+    raw.to_string()
 }
 
 async fn stream_chat(
@@ -2293,10 +2320,53 @@ fn render_panel_activity(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
 // ---------------------------------------------------------- tab: chat
 
 fn render_tab_chat(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(6), Constraint::Length(3)])
-        .split(area);
+    // If the engine isn't reachable, surface a banner row above the chat
+    // pane. A banner is far more discoverable than a single ⊘ in the footer
+    // when the user is looking at the Chat tab.
+    let engine_down = s.last_status_refresh.is_some() && s.node.is_none();
+    let rows = if engine_down {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3), // banner
+                Constraint::Min(6),
+                Constraint::Length(3),
+            ])
+            .split(area)
+    } else {
+        Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(6), Constraint::Length(3)])
+            .split(area)
+    };
+
+    let mut chat_idx = 0usize;
+    let mut input_idx = 1usize;
+    if engine_down {
+        let banner_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(ERR))
+            .title(Span::styled(
+                " Engine offline ",
+                Style::default().fg(ERR).add_modifier(Modifier::BOLD),
+            ));
+        let banner_inner = banner_block.inner(rows[0]);
+        f.render_widget(banner_block, rows[0]);
+        let line = Line::from(vec![
+            Span::styled("  the engine is not running. start it with  ", Style::default().fg(MUTED)),
+            Span::styled("mtw start", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled("  (or  ", Style::default().fg(MUTED)),
+            Span::styled("mtw serve", Style::default().fg(ACCENT)),
+            Span::styled("  in another terminal).", Style::default().fg(MUTED)),
+        ]);
+        f.render_widget(
+            Paragraph::new(line),
+            banner_inner.inner(Margin { horizontal: 1, vertical: 0 }),
+        );
+        chat_idx = 1;
+        input_idx = 2;
+    }
 
     // chat history
     let title = match s.chat_mode {
@@ -2304,8 +2374,8 @@ fn render_tab_chat(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
         ChatMode::Code => " Chat · mode: CODE (agent · reads/edits files, runs shell) · /chat to switch back ".to_string(),
     };
     let block = rounded_block(&title);
-    let inner = block.inner(rows[0]);
-    f.render_widget(block, rows[0]);
+    let inner = block.inner(rows[chat_idx]);
+    f.render_widget(block, rows[chat_idx]);
 
     let width = inner.width.saturating_sub(10) as usize;
     let mut lines: Vec<Line> = Vec::new();
@@ -2399,8 +2469,8 @@ fn render_tab_chat(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
         " Input ".into()
     };
     let input_block = rounded_block(&input_title);
-    let input_inner = input_block.inner(rows[1]);
-    f.render_widget(input_block, rows[1]);
+    let input_inner = input_block.inner(rows[input_idx]);
+    f.render_widget(input_block, rows[input_idx]);
     let (prompt_text, prompt_style) = if s.streaming {
         (" wait   ", Style::default().fg(WARN))
     } else {
