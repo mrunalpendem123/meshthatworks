@@ -48,10 +48,6 @@ pub enum Compat {
     Tight,
     /// Supported, but the model is too big for a single 8 GB device
     NeedsBigger,
-    /// Architecture NOT yet supported by SwiftLM
-    UnsupportedArch,
-    /// Tokenizer / loader currently broken in SwiftLM for this model
-    Blocked,
 }
 
 impl Compat {
@@ -60,8 +56,6 @@ impl Compat {
             Compat::Recommended => "RECOMMENDED for 8 GB",
             Compat::Tight => "tight on 8 GB",
             Compat::NeedsBigger => "needs 16 GB+ (or mesh)",
-            Compat::UnsupportedArch => "arch NOT supported by SwiftLM",
-            Compat::Blocked => "blocked: tokenizer/loader",
         }
     }
 }
@@ -123,18 +117,7 @@ pub const CATALOG: &[CatalogModel] = &[
         categories: &[Category::General, Category::Writing],
         note: "Priority #3 · Google's MoE · Apache 2.0 · 26B / 4B active · interleaved local+global attn",
     },
-    // 4. gpt-oss-20b (coding + reasoning)
-    CatalogModel {
-        hf_repo: "openai/gpt-oss-20b",
-        dir_name: "gpt-oss-20b",
-        name: "★ gpt-oss 20B",
-        size_gb: 41.4,
-        arch: "gpt_oss",
-        compat: Compat::UnsupportedArch,
-        categories: &[Category::Coding, Category::Reasoning],
-        note: "Priority #4 · OpenAI open weights · Apache 2.0 · arch not yet wired in SwiftLM",
-    },
-    // 5. GLM-4.7-Flash (coding/agentic)
+    // 4. GLM-4.7-Flash (coding/agentic)
     CatalogModel {
         hf_repo: "mlx-community/GLM-4.7-Flash-4bit",
         dir_name: "GLM-4.7-Flash-4bit",
@@ -143,7 +126,7 @@ pub const CATALOG: &[CatalogModel] = &[
         arch: "glm4_moe",
         compat: Compat::NeedsBigger,
         categories: &[Category::Coding, Category::General],
-        note: "Priority #5 · THUDM GLM · MIT · agentic-tuned · 32 GB Mac territory",
+        note: "Priority #4 · THUDM GLM · MIT · agentic-tuned · 32 GB Mac territory",
     },
 
     // ============ RECOMMENDED FOR YOUR 8 GB MAC ============
@@ -258,37 +241,6 @@ pub const CATALOG: &[CatalogModel] = &[
         compat: Compat::NeedsBigger,
         categories: &[Category::General, Category::Writing],
         note: "Mistral Mixtral 8x7B. Classic open-MoE. 32 GB Mac.",
-    },
-    // === UNSUPPORTED / EXPERIMENTAL (listed for awareness) ===
-    CatalogModel {
-        hf_repo: "mlx-community/DeepSeek-V4-Flash-4bit",
-        dir_name: "DeepSeek-V4-Flash-4bit",
-        name: "DeepSeek V4-Flash",
-        size_gb: 489.0,
-        arch: "deepseek_v4",
-        compat: Compat::UnsupportedArch,
-        categories: &[Category::Reasoning, Category::Heavy],
-        note: "Frontier MoE. ~489 GB at Q4 — out of reach for consumer Macs today.",
-    },
-    CatalogModel {
-        hf_repo: "mlx-community/DeepSeek-V2-Lite-Chat-4bit",
-        dir_name: "DeepSeek-V2-Lite-Chat-4bit",
-        name: "DeepSeek V2-Lite",
-        size_gb: 9.0,
-        arch: "deepseek_v2",
-        compat: Compat::UnsupportedArch,
-        categories: &[Category::General, Category::Reasoning],
-        note: "DeepSeek V2 Lite MoE. Architecture not yet wired in SwiftLM.",
-    },
-    CatalogModel {
-        hf_repo: "mlx-community/OLMoE-1B-7B-0125-Instruct-4bit",
-        dir_name: "OLMoE-1B-7B-0125-Instruct-4bit",
-        name: "OLMoE 1B-7B",
-        size_gb: 3.9,
-        arch: "olmoe",
-        compat: Compat::Blocked,
-        categories: &[Category::General],
-        note: "AllenAI OLMoE. Tokenizer (GPTNeoX) blocked in SwiftLM today.",
     },
 ];
 

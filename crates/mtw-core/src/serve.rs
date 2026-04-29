@@ -8,12 +8,18 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use iroh::{Endpoint, SecretKey, endpoint::presets, protocol::Router};
-use mtw_engine::InferenceEngine;
+use mtw_engine::{InferenceEngine, LayerPeer};
 
 use crate::health::{HEALTH_ALPN, HealthHandler};
 use crate::infer::{INFER_ALPN, InferHandler};
+use crate::layer::{LAYER_ALPN, LayerHandler};
+use crate::layer_forward::{LAYER_FORWARD_ALPN, LayerForwardHandler};
 
-pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow::Result<()> {
+pub async fn run(
+    secret: SecretKey,
+    engine: Arc<dyn InferenceEngine>,
+    layer_peer: Option<Arc<dyn LayerPeer>>,
+) -> anyhow::Result<()> {
     let info = engine.model_info().clone();
     let endpoint = Endpoint::builder(presets::N0)
         .secret_key(secret)
@@ -24,7 +30,7 @@ pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow:
     endpoint.online().await;
     let id = endpoint.id();
 
-    let router = Router::builder(endpoint)
+    let mut router_builder = Router::builder(endpoint)
         .accept(
             HEALTH_ALPN,
             HealthHandler {
@@ -32,7 +38,18 @@ pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow:
             },
         )
         .accept(INFER_ALPN, InferHandler::new(engine.clone()))
-        .spawn();
+        .accept(LAYER_ALPN, LayerHandler::new(engine.clone()));
+
+    let mut alpns = vec![
+        std::str::from_utf8(HEALTH_ALPN).unwrap(),
+        std::str::from_utf8(INFER_ALPN).unwrap(),
+        std::str::from_utf8(LAYER_ALPN).unwrap(),
+    ];
+    if let Some(peer) = layer_peer {
+        router_builder = router_builder.accept(LAYER_FORWARD_ALPN, LayerForwardHandler::new(peer));
+        alpns.push(std::str::from_utf8(LAYER_FORWARD_ALPN).unwrap());
+    }
+    let router = router_builder.spawn();
 
     let peer_count = crate::peers::load()
         .map(|list| list.peers.len())
@@ -44,11 +61,7 @@ pub async fn run(secret: SecretKey, engine: Arc<dyn InferenceEngine>) -> anyhow:
     println!("layers:      {}", info.num_layers);
     println!("peers known: {peer_count}");
     println!();
-    println!(
-        "ALPNs:       {}, {}",
-        std::str::from_utf8(HEALTH_ALPN).unwrap(),
-        std::str::from_utf8(INFER_ALPN).unwrap(),
-    );
+    println!("ALPNs:       {}", alpns.join(", "));
     println!("press ctrl-c to stop.");
 
     tokio::signal::ctrl_c()

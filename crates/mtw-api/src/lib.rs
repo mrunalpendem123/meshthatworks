@@ -8,7 +8,10 @@
 //! Keeping it as an HTTP entry point means any OpenAI client (Claude Code,
 //! curl, Python `openai` SDK) can drive the mesh without being mesh-aware.
 
+use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use anyhow::Context;
 use axum::{
@@ -48,6 +51,15 @@ pub struct ProxyConfig {
     pub model_label: Option<String>,
     /// Snapshot of node identity + model, served at `/status`.
     pub status: NodeStatus,
+    /// Counter bumped on every `/v1/chat/completions` and `/v1/completions`
+    /// request that we forward upstream. Shared with the engine's memory
+    /// sampler so RSS samples are correlated with request boundaries — the
+    /// "OOM after N requests" pattern needs this to be debuggable.
+    pub request_counter: Option<Arc<AtomicU64>>,
+    /// Path of the log file the engine sampler writes to. When set, the
+    /// proxy emits `[mtw-req]` markers there too so the timeline is one
+    /// stream. Defaults to `MTW_SWIFTLM_LOG` env var.
+    pub trace_log_path: Option<String>,
 }
 
 #[derive(Clone)]
@@ -55,6 +67,9 @@ struct AppState {
     upstream: Arc<str>,
     client: reqwest::Client,
     status: Arc<NodeStatus>,
+    request_counter: Option<Arc<AtomicU64>>,
+    trace_log_path: Option<Arc<str>>,
+    started: Instant,
 }
 
 pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
@@ -65,6 +80,9 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
         upstream: Arc::from(cfg.upstream.clone()),
         client,
         status: Arc::new(cfg.status),
+        request_counter: cfg.request_counter,
+        trace_log_path: cfg.trace_log_path.map(Arc::from),
+        started: Instant::now(),
     };
 
     let app = Router::new()
@@ -127,6 +145,29 @@ async fn proxy(
 ) -> axum::response::Response {
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
     let target_url = format!("{}{}", state.upstream, path_and_query);
+
+    // Bump request counter and emit a [mtw-req] marker for inference paths so
+    // the engine's memory sampler can correlate RSS deltas with request
+    // boundaries. Models endpoint and status are too chatty to count.
+    if matches!(
+        uri.path(),
+        "/v1/chat/completions" | "/v1/completions" | "/v1/layer-forward"
+    ) {
+        if let Some(c) = &state.request_counter {
+            let n = c.fetch_add(1, Ordering::Relaxed) + 1;
+            if let Some(p) = state.trace_log_path.as_ref() {
+                let line = format!(
+                    "[mtw-req] t_ms={} path={} requests={}\n",
+                    state.started.elapsed().as_millis(),
+                    uri.path(),
+                    n,
+                );
+                if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(p.as_ref()) {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
+        }
+    }
 
     let mut builder = state.client.request(method.clone(), &target_url);
     for (name, value) in headers.iter() {

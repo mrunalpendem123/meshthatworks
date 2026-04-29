@@ -1,5 +1,6 @@
 mod catalog;
 mod dashboard;
+mod doctor;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -81,6 +82,10 @@ enum Command {
     },
     /// List peers saved at ~/.mtw/peers.json.
     Peers,
+    /// Connectivity self-check: IPv6 reachability, public IPv4, CGNAT detection,
+    /// NAT type (via STUN), and macOS firewall state. Predicts whether pairing
+    /// will be direct or fall back to relay.
+    Doctor,
     /// Launch a terminal UI that shows this node's state and its peers.
     Dashboard {
         /// Base URL of the mtw-api proxy to query for /status.
@@ -135,14 +140,20 @@ enum EchoCmd {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // The dashboard is a full-screen TUI in raw mode; any writer that touches
-    // stderr will paint over the frame. Route logs to a file instead. Users
-    // can tail `/tmp/mtw-dashboard.log` (or set MTW_LOG_FILE) for details.
-    // Other commands keep stderr logging.
-    if matches!(cli.command, Command::Dashboard { .. }) {
-        init_tracing_file()?;
-    } else {
-        init_tracing_stderr();
+    // The dashboard is a full-screen TUI in raw mode, so its logs go to a file.
+    // `mtw serve` is long-running and gets very chatty (iroh net_report, hyper,
+    // etc.); when the user runs `mtw serve` and `mtw dashboard` in the same
+    // terminal, serve's stderr paints over the dashboard. Send serve's logs to
+    // a file too. Short-lived commands (pair/join/status/...) keep stderr.
+    match cli.command {
+        Command::Dashboard { .. } => {
+            init_tracing_file("/tmp/mtw-dashboard.log")?;
+        }
+        Command::Serve { .. } => {
+            init_tracing_file("/tmp/mtw-serve.log")?;
+            eprintln!("[mtw] logs → /tmp/mtw-serve.log  (override with MTW_LOG_FILE=...)");
+        }
+        _ => init_tracing_stderr(),
     }
 
     match cli.command {
@@ -188,6 +199,7 @@ async fn main() -> anyhow::Result<()> {
             mtw_core::pair::join(secret, &invite).await
         }
         Command::Peers => peers_cmd(),
+        Command::Doctor => doctor::run().await,
         Command::Dashboard {
             url,
             tick_ms,
@@ -239,16 +251,29 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
 
     let secret = mtw_core::identity::load_or_create()?;
 
-    // Build the engine according to the flags.
-    let engine: Arc<dyn InferenceEngine> = if args.mock {
+    // Build the engine according to the flags. Pull the SwiftLM request
+    // counter and a LayerPeer handle out alongside the engine — the HTTP
+    // proxy uses the counter to share with the engine's memory sampler;
+    // mtw_core::serve uses the LayerPeer to expose `mtw/layer-forward/0`.
+    let (engine, request_counter, layer_peer): (
+        Arc<dyn InferenceEngine>,
+        Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+        Option<Arc<dyn mtw_engine::LayerPeer>>,
+    ) = if args.mock {
         println!("mtw serve: --mock set, using MockEngine (no real inference)");
-        Arc::new(MockEngine::olmoe())
+        (Arc::new(MockEngine::olmoe()), None, None)
     } else if let Some(url) = args.attach.clone() {
         println!("mtw serve: attaching to SwiftLM at {url}");
         let engine = SwiftLMEngine::attach(&url, Some(&args.model))
             .await
             .with_context(|| format!("attach SwiftLM at {url}"))?;
-        Arc::new(engine)
+        let counter = engine.request_counter();
+        let arc: Arc<SwiftLMEngine> = Arc::new(engine);
+        (
+            arc.clone() as Arc<dyn InferenceEngine>,
+            Some(counter),
+            Some(arc as Arc<dyn mtw_engine::LayerPeer>),
+        )
     } else {
         println!("mtw serve: spawning SwiftLM");
         println!("  binary: {}", args.swiftlm.display());
@@ -270,7 +295,13 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         let engine = SwiftLMEngine::spawn(opts)
             .await
             .context("spawn SwiftLM")?;
-        Arc::new(engine)
+        let counter = engine.request_counter();
+        let arc: Arc<SwiftLMEngine> = Arc::new(engine);
+        (
+            arc.clone() as Arc<dyn InferenceEngine>,
+            Some(counter),
+            Some(arc as Arc<dyn mtw_engine::LayerPeer>),
+        )
     };
 
     // Proxy forwards to whatever engine's URL is. For MockEngine there is
@@ -303,8 +334,10 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     // a shutdown signal aborts both and we drop the engine to propagate
     // `kill_on_drop` to the SwiftLM child.
     let mesh_engine = engine.clone();
-    let mut mesh_handle =
-        tokio::spawn(async move { mtw_core::serve::run(secret, mesh_engine).await });
+    let mesh_layer_peer = layer_peer.clone();
+    let mut mesh_handle = tokio::spawn(async move {
+        mtw_core::serve::run(secret, mesh_engine, mesh_layer_peer).await
+    });
 
     // We always start the proxy so /status and /healthz are available; even
     // in --mock mode with no upstream, /v1/* will simply 502, but the
@@ -315,6 +348,10 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         upstream: upstream.unwrap_or_else(|| "http://127.0.0.1:0".into()),
         model_label: Some(engine.model_info().name.clone()),
         status: status_for_proxy,
+        request_counter,
+        trace_log_path: Some(
+            std::env::var("MTW_SWIFTLM_LOG").unwrap_or_else(|_| "/tmp/mtw-swiftlm.log".into()),
+        ),
     });
     let mut proxy_handle = proxy_cfg.map(|cfg| tokio::spawn(async move { mtw_api::run(cfg).await }));
 
@@ -426,9 +463,8 @@ fn init_tracing_stderr() {
         .init();
 }
 
-fn init_tracing_file() -> anyhow::Result<()> {
-    let log_path = std::env::var("MTW_LOG_FILE")
-        .unwrap_or_else(|_| "/tmp/mtw-dashboard.log".into());
+fn init_tracing_file(default_path: &str) -> anyhow::Result<()> {
+    let log_path = std::env::var("MTW_LOG_FILE").unwrap_or_else(|_| default_path.into());
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

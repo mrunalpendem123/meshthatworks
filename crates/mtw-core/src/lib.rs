@@ -7,6 +7,8 @@ pub mod echo;
 pub mod health;
 pub mod identity;
 pub mod infer;
+pub mod layer;
+pub mod layer_forward;
 pub mod pair;
 pub mod peers;
 pub mod serve;

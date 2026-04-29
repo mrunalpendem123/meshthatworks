@@ -7,9 +7,11 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
+pub mod layer_split;
 pub mod mock;
 pub mod swiftlm;
 
+pub use layer_split::LayerSplitEngine;
 pub use mock::MockEngine;
 pub use swiftlm::SwiftLMEngine;
 
@@ -98,10 +100,35 @@ pub struct ChatResponse {
     pub latency_ms: u128,
 }
 
+/// One peer in a layer-split pipeline. Either a local `SwiftLMEngine`
+/// (HTTP to a co-located SwiftLM) or an iroh-transported `IrohLayerPeer`
+/// (forwards to a remote `mtw serve` over `mtw/layer-forward/0`). The two
+/// methods mirror SwiftLM's `/v1/layer-forward` HTTP contract:
+/// `run_partial_tokens` for the first peer (embeds tokens + runs its slice),
+/// `run_partial_activation` for middle/last peers (consumes the previous
+/// peer's activation, returns either the next activation or final logits).
+#[async_trait]
+pub trait LayerPeer: Send + Sync {
+    /// First-peer entry point: send raw token IDs, get the post-slice
+    /// activation `[batch, seq, hidden]`.
+    async fn run_partial_tokens(
+        &self,
+        tokens: &[i32],
+        shape: Vec<usize>,
+    ) -> anyhow::Result<ActivationTensor>;
+
+    /// Middle/last-peer entry point: send a previous peer's activation,
+    /// get either the next activation or final logits.
+    async fn run_partial_activation(
+        &self,
+        input: ActivationTensor,
+    ) -> anyhow::Result<ActivationTensor>;
+}
+
 /// The per-node inference engine. Implementations:
 /// - [`MockEngine`] — deterministic stand-in, useful for mesh development and tests.
 /// - [`SwiftLMEngine`] — drives a local SwiftLM process over its OpenAI-compatible API.
-/// - Future `LayerSplitEngine` will route per-layer forward passes across peers.
+/// - [`LayerSplitEngine`] — orchestrates layer-split inference across multiple [`LayerPeer`]s.
 #[async_trait]
 pub trait InferenceEngine: Send + Sync {
     fn model_info(&self) -> &ModelInfo;

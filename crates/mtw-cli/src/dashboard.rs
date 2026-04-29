@@ -13,9 +13,13 @@
 //!
 //! Key bindings:
 //!   Tab / Shift-Tab   cycle tabs       (or 1–5 for direct)
+//!   ← / →             cycle tabs       (filter category on Models tab)
+//!   ↑ / ↓             move cursor      (Models tab)
+//!   D                 delete model     (Models tab, installed only)
 //!   Enter             send chat prompt  (Chat tab)
 //!   any char          typed into input  (Chat tab)
 //!   Ctrl-L            clear chat
+//!   Ctrl-O            launch opencode against our proxy (Chat tab)
 //!   Ctrl-R            force ping round
 //!   ? or F1           toggle help overlay
 //!   q (outside chat) / Esc / Ctrl-C    quit
@@ -104,6 +108,25 @@ enum ActivityKind {
     Ok,
     Warn,
     Err,
+}
+
+/// Chat tab modes. `Chat` is plain LLM dialog; `Code` runs an in-UI agent
+/// loop that lets the model read/write files and run shell commands in the
+/// dashboard's working directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum ChatMode {
+    #[default]
+    Chat,
+    Code,
+}
+
+impl ChatMode {
+    fn label(&self) -> &'static str {
+        match self {
+            ChatMode::Chat => "Chat",
+            ChatMode::Code => "Code",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +228,14 @@ struct SharedState {
     last_models_refresh: Option<Instant>,
 
     spinner_frame: usize,
+
+    /// Toggled with Ctrl-O. In `Code` mode, the chat runs as an in-UI agent
+    /// loop with file/shell tools instead of a plain LLM chat.
+    chat_mode: ChatMode,
+
+    /// Result of the connectivity self-check (run once at dashboard startup).
+    /// `None` while the probe is still in flight.
+    connectivity: Option<crate::doctor::Report>,
 }
 
 impl SharedState {
@@ -240,6 +271,8 @@ impl SharedState {
             last_ping_round: self.last_ping_round,
             last_models_refresh: self.last_models_refresh,
             spinner_frame: self.spinner_frame,
+            chat_mode: self.chat_mode,
+            connectivity: self.connectivity.clone(),
         }
     }
 
@@ -279,6 +312,29 @@ pub async fn run(args: DashboardArgs) -> anyhow::Result<()> {
         let ping_every = args.ping_every;
         tokio::spawn(async move { refresh_loop(state, url, endpoint, ping_every).await })
     };
+
+    // One-shot connectivity probe at startup. Runs in the background so the
+    // dashboard frame paints immediately; the badge updates ~5–10s later when
+    // STUN + HTTP probes finish.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state.lock().await.push_activity(
+                ActivityKind::Info,
+                "connectivity: probing IPv6 / IPv4 / NAT…",
+            );
+            let report = crate::doctor::collect().await;
+            let summary = report.short_summary();
+            let mut s = state.lock().await;
+            let kind = match report.connectivity() {
+                crate::doctor::Connectivity::Direct => ActivityKind::Ok,
+                crate::doctor::Connectivity::Relay => ActivityKind::Warn,
+                crate::doctor::Connectivity::NoInternet => ActivityKind::Err,
+            };
+            s.push_activity(kind, format!("connectivity: {summary}"));
+            s.connectivity = Some(report);
+        });
+    }
 
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = std::io::stdout();
@@ -349,6 +405,7 @@ async fn ui_loop(
                 _ => {}
             }
         }
+
     }
 }
 
@@ -433,7 +490,7 @@ async fn handle_key(
             state.lock().await.overlay = Overlay::Help;
             return false;
         }
-        KeyCode::Tab | KeyCode::Right => {
+        KeyCode::Tab => {
             let mut s = state.lock().await;
             if let Some(t) = s.tab {
                 let i = (t.index() + 1) % Tab::ORDER.len();
@@ -441,9 +498,40 @@ async fn handle_key(
             }
             return false;
         }
-        KeyCode::BackTab | KeyCode::Left => {
+        KeyCode::BackTab => {
             let mut s = state.lock().await;
             if let Some(t) = s.tab {
+                let i = (t.index() + Tab::ORDER.len() - 1) % Tab::ORDER.len();
+                s.tab = Some(Tab::ORDER[i]);
+            }
+            return false;
+        }
+        KeyCode::Right => {
+            let mut s = state.lock().await;
+            if s.tab == Some(Tab::Models) {
+                let cur = Category::FILTERS
+                    .iter()
+                    .position(|c| *c == s.models_filter)
+                    .unwrap_or(0);
+                s.models_filter = Category::FILTERS[(cur + 1) % Category::FILTERS.len()];
+                s.models_cursor = 0;
+            } else if let Some(t) = s.tab {
+                let i = (t.index() + 1) % Tab::ORDER.len();
+                s.tab = Some(Tab::ORDER[i]);
+            }
+            return false;
+        }
+        KeyCode::Left => {
+            let mut s = state.lock().await;
+            if s.tab == Some(Tab::Models) {
+                let cur = Category::FILTERS
+                    .iter()
+                    .position(|c| *c == s.models_filter)
+                    .unwrap_or(0);
+                let n = Category::FILTERS.len();
+                s.models_filter = Category::FILTERS[(cur + n - 1) % n];
+                s.models_cursor = 0;
+            } else if let Some(t) = s.tab {
                 let i = (t.index() + Tab::ORDER.len() - 1) % Tab::ORDER.len();
                 s.tab = Some(Tab::ORDER[i]);
             }
@@ -462,6 +550,17 @@ async fn handle_key(
             s.chat.clear();
             s.chat_error = None;
             s.push_activity(ActivityKind::Info, "chat cleared");
+            return false;
+        }
+        KeyCode::Char('o') if ctrl && in_chat => {
+            // Ctrl-O cycles between Chat and Code modes (in-UI agentic coding).
+            let mut s = state.lock().await;
+            s.chat_mode = match s.chat_mode {
+                ChatMode::Chat => ChatMode::Code,
+                ChatMode::Code => ChatMode::Chat,
+            };
+            let label = s.chat_mode.label();
+            s.push_activity(ActivityKind::Info, format!("chat mode → {label}"));
             return false;
         }
         _ => {}
@@ -567,6 +666,9 @@ async fn handle_key(
                 state.lock().await.input.pop();
             }
             KeyCode::Enter => {
+                if handle_slash_command(state.clone()).await {
+                    return false;
+                }
                 send_prompt(state.clone(), url.to_string()).await;
             }
             KeyCode::Char(c) => {
@@ -579,6 +681,60 @@ async fn handle_key(
         }
     }
     false
+}
+
+/// Slash commands typed in the chat input — Mac-friendly mode toggling and
+/// utilities. Returns true if the input was a slash command (and was handled),
+/// so the caller skips the LLM dispatch.
+///
+/// Only **known** commands trigger handling, so absolute paths like
+/// `/Users/foo/bar` (e.g. dragged-in files) fall through to the normal
+/// chat path and are attachment-detected there.
+async fn handle_slash_command(state: Arc<Mutex<SharedState>>) -> bool {
+    let raw = {
+        let s = state.lock().await;
+        s.input.trim().to_string()
+    };
+    if !raw.starts_with('/') {
+        return false;
+    }
+    let body = raw.trim_start_matches('/');
+    // First "token" is what's before any whitespace OR another '/'. That way
+    // /Users/foo's first token is "Users", not the whole path.
+    let first = body
+        .split(|c: char| c.is_whitespace() || c == '/')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let known = matches!(
+        first.as_str(),
+        "code" | "chat" | "clear" | "help" | "?"
+    );
+    if !known {
+        return false;
+    }
+    let mut s = state.lock().await;
+    s.input.clear();
+    match first.as_str() {
+        "code" => {
+            s.chat_mode = ChatMode::Code;
+            s.push_activity(ActivityKind::Info, "chat mode → Code");
+        }
+        "chat" => {
+            s.chat_mode = ChatMode::Chat;
+            s.push_activity(ActivityKind::Info, "chat mode → Chat");
+        }
+        "clear" => {
+            s.chat.clear();
+            s.chat_error = None;
+            s.push_activity(ActivityKind::Info, "chat cleared");
+        }
+        "help" | "?" => {
+            s.overlay = Overlay::Help;
+        }
+        _ => unreachable!(),
+    }
+    true
 }
 
 // ---------------------------------------------------------- pair / join
@@ -764,12 +920,142 @@ async fn submit_join(state: Arc<Mutex<SharedState>>) {
 // ---------------------------------------------------------- send + stream
 
 async fn send_prompt(state: Arc<Mutex<SharedState>>, url: String) {
-    let (model_name, history, prompt_text) = {
+    let mode = state.lock().await.chat_mode;
+    match mode {
+        ChatMode::Chat => run_chat_turn(state, url).await,
+        ChatMode::Code => run_agent_turn(state, url).await,
+    }
+}
+
+/// Result of preparing a user prompt: any absolute paths in the raw input
+/// that exist on disk get pulled in as `<file>`/`<dir>` context blocks, so
+/// drag-and-drop "just works" the way it does in opencode/Cursor.
+struct PreparedPrompt {
+    /// Final text inlined into the chat history (and seen by the model).
+    text: String,
+    /// How many paths were attached — purely for the activity feed.
+    attached: usize,
+}
+
+const ATTACH_FILE_BUDGET_BYTES: usize = 16 * 1024;
+const ATTACH_DIR_ENTRY_LIMIT: usize = 200;
+
+async fn prepare_prompt(raw: &str) -> PreparedPrompt {
+    // Tokenize on whitespace. macOS terminal drag pastes one path per drop,
+    // separated by spaces. Backslash-escaped spaces in paths (`/Users/foo\ bar`)
+    // would split incorrectly here — we accept that as a known limitation,
+    // since Desktop drops in this app are usually unescaped.
+    let mut attachments: Vec<String> = Vec::new();
+    let mut other_words: Vec<&str> = Vec::new();
+
+    for token in raw.split_whitespace() {
+        // Strip a trailing colon/comma a user may have typed after pasting.
+        let cleaned = token.trim_end_matches([':', ',']);
+        if cleaned.starts_with('/') && std::path::Path::new(cleaned).exists() {
+            attachments.push(cleaned.to_string());
+        } else {
+            other_words.push(token);
+        }
+    }
+
+    let cleaned_prompt = other_words.join(" ");
+
+    if attachments.is_empty() {
+        return PreparedPrompt {
+            text: raw.to_string(),
+            attached: 0,
+        };
+    }
+
+    let mut preamble = String::from("[Attached for context]\n\n");
+    for path_str in &attachments {
+        let p = std::path::Path::new(path_str);
+        let is_dir = p.is_dir();
+        if is_dir {
+            preamble.push_str(&format!("<dir path=\"{path_str}\">\n"));
+            match tokio::fs::read_dir(p).await {
+                Ok(mut rd) => {
+                    let mut entries = Vec::new();
+                    while let Ok(Some(e)) = rd.next_entry().await {
+                        let is_dir = e
+                            .file_type()
+                            .await
+                            .map(|t| t.is_dir())
+                            .unwrap_or(false);
+                        let n = e.file_name().to_string_lossy().to_string();
+                        entries.push(if is_dir { format!("{n}/") } else { n });
+                        if entries.len() >= ATTACH_DIR_ENTRY_LIMIT {
+                            entries.push(format!(
+                                "...(more entries truncated at {ATTACH_DIR_ENTRY_LIMIT})"
+                            ));
+                            break;
+                        }
+                    }
+                    entries.sort();
+                    preamble.push_str(&entries.join("\n"));
+                }
+                Err(e) => preamble.push_str(&format!("(error: {e})")),
+            }
+            preamble.push_str("\n</dir>\n\n");
+        } else {
+            preamble.push_str(&format!("<file path=\"{path_str}\">\n"));
+            match tokio::fs::read(p).await {
+                Ok(bytes) => {
+                    // Skip obvious binary blobs.
+                    let is_text = std::str::from_utf8(&bytes).is_ok();
+                    if !is_text {
+                        preamble.push_str(&format!(
+                            "(binary file, {} bytes — skipped)",
+                            bytes.len()
+                        ));
+                    } else if bytes.len() > ATTACH_FILE_BUDGET_BYTES {
+                        let head = &bytes[..ATTACH_FILE_BUDGET_BYTES];
+                        preamble.push_str(&String::from_utf8_lossy(head));
+                        preamble.push_str(&format!(
+                            "\n...[truncated: {ATTACH_FILE_BUDGET_BYTES} of {} bytes shown]",
+                            bytes.len()
+                        ));
+                    } else {
+                        preamble.push_str(&String::from_utf8_lossy(&bytes));
+                    }
+                }
+                Err(e) => preamble.push_str(&format!("(error: {e})")),
+            }
+            preamble.push_str("\n</file>\n\n");
+        }
+    }
+
+    let final_question = if cleaned_prompt.is_empty() {
+        "What do you make of this? Help me understand or work with it.".to_string()
+    } else {
+        cleaned_prompt
+    };
+
+    PreparedPrompt {
+        text: format!("{preamble}{final_question}"),
+        attached: attachments.len(),
+    }
+}
+
+async fn run_chat_turn(state: Arc<Mutex<SharedState>>, url: String) {
+    let raw = {
         let mut s = state.lock().await;
         if s.streaming || s.input.trim().is_empty() {
             return;
         }
-        let prompt = std::mem::take(&mut s.input);
+        std::mem::take(&mut s.input)
+    };
+    let prepared = prepare_prompt(&raw).await;
+    if prepared.attached > 0 {
+        state.lock().await.push_activity(
+            ActivityKind::Info,
+            format!("attached {} path(s) to prompt", prepared.attached),
+        );
+    }
+
+    let (model_name, history, prompt_text) = {
+        let mut s = state.lock().await;
+        let prompt = prepared.text;
         let prompt_clone = prompt.clone();
         s.chat.push(ChatTurn {
             role: "user".into(),
@@ -791,7 +1077,10 @@ async fn send_prompt(state: Arc<Mutex<SharedState>>, url: String) {
             .chat
             .iter()
             .filter(|t| !t.content.is_empty() && !t.content.starts_with("[error:"))
-            .map(|t| serde_json::json!({"role": t.role, "content": t.content}))
+            .map(|t| serde_json::json!({
+                "role": if t.role == "tool_result" { "user" } else { t.role.as_str() },
+                "content": t.content,
+            }))
             .collect();
 
         let model_name = s
@@ -832,6 +1121,374 @@ async fn send_prompt(state: Arc<Mutex<SharedState>>, url: String) {
             }
         }
     });
+}
+
+const AGENT_MAX_STEPS: usize = 12;
+
+fn agent_system_prompt(cwd: &str) -> String {
+    format!(
+        "You are MeshThatWorks Code, an in-terminal coding agent.\n\
+         Working directory: {cwd}\n\
+         \n\
+         You have these tools. To call one, emit its tag in your reply. The runtime will\n\
+         execute it and feed the output back as the next user message. Then you decide what\n\
+         to do next.\n\
+         \n\
+           <read path=\"relative/path.ext\"/>           — show file contents\n\
+           <list path=\"relative/dir\"/>                — list a directory\n\
+           <bash>shell command</bash>                  — run a command in the working dir\n\
+           <write path=\"relative/path.ext\">           — replace (or create) a file with the\n\
+           <full new file contents go here>             body between the tags. ALWAYS include\n\
+           </write>                                     the entire file, never a diff.\n\
+           <done/>                                     — emit when the task is complete.\n\
+         \n\
+         Rules:\n\
+         - One tool per reply. Think briefly, then call exactly one tool, OR emit <done/>.\n\
+         - Read files before editing them. Don't fabricate paths or contents.\n\
+         - After <bash>, look at stdout/stderr/exit. After <read>, you'll see the file body.\n\
+         - Use <bash>cargo build</bash> or similar to verify changes.\n\
+         - Keep prose outside of tags short — the user mostly cares about the result.\n\
+         \n\
+         Begin.\n"
+    )
+}
+
+async fn run_agent_turn(state: Arc<Mutex<SharedState>>, url: String) {
+    let raw = {
+        let mut s = state.lock().await;
+        if s.streaming || s.input.trim().is_empty() {
+            return;
+        }
+        std::mem::take(&mut s.input)
+    };
+    let prepared = prepare_prompt(&raw).await;
+    if prepared.attached > 0 {
+        state.lock().await.push_activity(
+            ActivityKind::Info,
+            format!("attached {} path(s) to prompt", prepared.attached),
+        );
+    }
+
+    let (model_name, prompt_text) = {
+        let mut s = state.lock().await;
+        let prompt = prepared.text;
+        let prompt_clone = prompt.clone();
+        s.chat.push(ChatTurn {
+            role: "user".into(),
+            content: prompt,
+            tokens: None,
+            elapsed_ms: None,
+        });
+        s.streaming = true;
+        s.chat_error = None;
+        s.push_activity(
+            ActivityKind::Info,
+            format!("code: {}", truncate(prompt_clone.clone(), 60)),
+        );
+
+        let model_name = s
+            .node
+            .as_ref()
+            .map(|n| n.model.name.clone())
+            .unwrap_or_else(|| "mesh".into());
+        (model_name, prompt_clone)
+    };
+
+    let cwd = std::env::current_dir()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| ".".into());
+    let system = agent_system_prompt(&cwd);
+
+    let state_clone = state.clone();
+    let url_clone = url.clone();
+    tokio::spawn(async move {
+        let mut steps = 0usize;
+        let mut last_err: Option<String> = None;
+
+        loop {
+            if steps >= AGENT_MAX_STEPS {
+                state_clone.lock().await.push_activity(
+                    ActivityKind::Warn,
+                    format!("agent: hit step cap ({AGENT_MAX_STEPS}) — stopping"),
+                );
+                break;
+            }
+            steps += 1;
+
+            // Build the message history for this iteration.
+            let history = {
+                let s = state_clone.lock().await;
+                let mut msgs = vec![serde_json::json!({"role": "system", "content": system})];
+                for t in &s.chat {
+                    if t.content.is_empty() || t.content.starts_with("[error:") {
+                        continue;
+                    }
+                    let role = match t.role.as_str() {
+                        "tool_result" => "user",
+                        "assistant" => "assistant",
+                        _ => "user",
+                    };
+                    msgs.push(serde_json::json!({"role": role, "content": t.content}));
+                }
+                msgs
+            };
+
+            // Push an empty assistant turn that stream_chat will fill.
+            state_clone.lock().await.chat.push(ChatTurn {
+                role: "assistant".into(),
+                content: String::new(),
+                tokens: None,
+                elapsed_ms: None,
+            });
+
+            let started = Instant::now();
+            let res = stream_chat(
+                url_clone.clone(),
+                model_name.clone(),
+                history,
+                state_clone.clone(),
+            )
+            .await;
+            let elapsed = started.elapsed().as_millis();
+
+            let assistant_text = {
+                let mut s = state_clone.lock().await;
+                match res {
+                    Ok(tok) => {
+                        if let Some(last) = s.chat.last_mut() {
+                            last.tokens = Some(tok);
+                            last.elapsed_ms = Some(elapsed);
+                        }
+                    }
+                    Err(e) => {
+                        last_err = Some(format!("{e:#}"));
+                        break;
+                    }
+                }
+                s.chat.last().map(|t| t.content.clone()).unwrap_or_default()
+            };
+
+            // Parse for tool calls. Stop if <done/> or no tools.
+            if assistant_text.contains("<done/>")
+                || assistant_text.contains("<done />")
+                || assistant_text.contains("<done>")
+            {
+                state_clone
+                    .lock()
+                    .await
+                    .push_activity(ActivityKind::Ok, format!("agent: done in {steps} step(s)"));
+                break;
+            }
+
+            let calls = parse_tool_calls(&assistant_text);
+            if calls.is_empty() {
+                // No tool, no <done/> — model just talked. End the turn.
+                state_clone.lock().await.push_activity(
+                    ActivityKind::Info,
+                    "agent: no tool call in reply — stopping",
+                );
+                break;
+            }
+
+            // Execute each tool call in order, push its result as a tool_result turn.
+            for call in calls {
+                let label = call.label();
+                state_clone
+                    .lock()
+                    .await
+                    .push_activity(ActivityKind::Info, format!("tool: {label}"));
+                let result = execute_tool(&call).await;
+                let body = format!("<tool_result for=\"{label}\">\n{result}\n</tool_result>");
+                state_clone.lock().await.chat.push(ChatTurn {
+                    role: "tool_result".into(),
+                    content: body,
+                    tokens: None,
+                    elapsed_ms: None,
+                });
+            }
+        }
+
+        let mut s = state_clone.lock().await;
+        s.streaming = false;
+        if let Some(e) = last_err {
+            s.chat_error = Some(e.clone());
+            s.push_activity(ActivityKind::Err, format!("agent error: {e}"));
+        }
+        let _ = prompt_text;
+    });
+}
+
+#[derive(Debug)]
+enum ToolCall {
+    Read { path: String },
+    List { path: String },
+    Bash { cmd: String },
+    Write { path: String, body: String },
+}
+
+impl ToolCall {
+    fn label(&self) -> &'static str {
+        match self {
+            ToolCall::Read { .. } => "read",
+            ToolCall::List { .. } => "list",
+            ToolCall::Bash { .. } => "bash",
+            ToolCall::Write { .. } => "write",
+        }
+    }
+}
+
+fn parse_tool_calls(text: &str) -> Vec<ToolCall> {
+    let mut out = Vec::new();
+    // Self-closing: <read path="..."/>  and  <list path="..."/>
+    for tag in ["read", "list"] {
+        let needle = format!("<{tag}");
+        let mut cursor = 0usize;
+        while let Some(found) = text[cursor..].find(&needle) {
+            let start = cursor + found;
+            let after = start + needle.len();
+            let rest = &text[after..];
+            let close = rest.find("/>").map(|i| (i, 2usize));
+            let close = close.or_else(|| rest.find('>').map(|i| (i, 1usize)));
+            let Some((rel_end, close_len)) = close else {
+                break;
+            };
+            let attrs = &rest[..rel_end];
+            let path = extract_attr(attrs, "path").unwrap_or_default();
+            if !path.is_empty() {
+                out.push(match tag {
+                    "read" => ToolCall::Read { path: path.into() },
+                    "list" => ToolCall::List { path: path.into() },
+                    _ => unreachable!(),
+                });
+            }
+            cursor = after + rel_end + close_len;
+        }
+    }
+
+    // Block tags with bodies: <bash>...</bash>  and  <write path="…">...</write>
+    for tag in ["bash", "write"] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut cursor = 0usize;
+        while let Some(found) = text[cursor..].find(&open) {
+            let start = cursor + found;
+            let after = start + open.len();
+            let rest = &text[after..];
+            let Some(gt) = rest.find('>') else { break };
+            let attrs = &rest[..gt];
+            let body_start = after + gt + 1;
+            let Some(end) = text[body_start..].find(&close) else {
+                break;
+            };
+            let body = &text[body_start..body_start + end];
+            match tag {
+                "bash" => out.push(ToolCall::Bash {
+                    cmd: body.trim().to_string(),
+                }),
+                "write" => {
+                    let path = extract_attr(attrs, "path").unwrap_or_default();
+                    if !path.is_empty() {
+                        // Strip a single leading newline from body if present.
+                        let body = body.strip_prefix('\n').unwrap_or(body);
+                        out.push(ToolCall::Write {
+                            path: path.into(),
+                            body: body.to_string(),
+                        });
+                    }
+                }
+                _ => {}
+            }
+            cursor = body_start + end + close.len();
+        }
+    }
+    out
+}
+
+fn extract_attr<'a>(attrs: &'a str, key: &str) -> Option<&'a str> {
+    let needle = format!("{key}=");
+    let i = attrs.find(&needle)?;
+    let rest = &attrs[i + needle.len()..];
+    let quote = rest.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let body = &rest[1..];
+    let end = body.find(quote)?;
+    Some(&body[..end])
+}
+
+async fn execute_tool(call: &ToolCall) -> String {
+    const MAX_BYTES: usize = 8 * 1024;
+
+    fn truncate_for_model(s: String) -> String {
+        if s.len() <= MAX_BYTES {
+            s
+        } else {
+            let cut = &s[..MAX_BYTES];
+            format!(
+                "{cut}\n...[truncated: {} bytes shown of {}]",
+                MAX_BYTES,
+                s.len()
+            )
+        }
+    }
+
+    match call {
+        ToolCall::Read { path } => match tokio::fs::read_to_string(path).await {
+            Ok(body) => truncate_for_model(body),
+            Err(e) => format!("error: read {path}: {e}"),
+        },
+        ToolCall::List { path } => match tokio::fs::read_dir(path).await {
+            Ok(mut rd) => {
+                let mut entries = Vec::new();
+                while let Ok(Some(e)) = rd.next_entry().await {
+                    let is_dir = e
+                        .file_type()
+                        .await
+                        .map(|t| t.is_dir())
+                        .unwrap_or(false);
+                    let name = e.file_name().to_string_lossy().to_string();
+                    entries.push(if is_dir {
+                        format!("{name}/")
+                    } else {
+                        name
+                    });
+                }
+                entries.sort();
+                truncate_for_model(entries.join("\n"))
+            }
+            Err(e) => format!("error: list {path}: {e}"),
+        },
+        ToolCall::Bash { cmd } => {
+            let output = tokio::process::Command::new("bash")
+                .arg("-lc")
+                .arg(cmd)
+                .output()
+                .await;
+            match output {
+                Ok(o) => {
+                    let stdout = String::from_utf8_lossy(&o.stdout).to_string();
+                    let stderr = String::from_utf8_lossy(&o.stderr).to_string();
+                    let exit = o.status.code().unwrap_or(-1);
+                    truncate_for_model(format!(
+                        "exit: {exit}\n--- stdout ---\n{stdout}--- stderr ---\n{stderr}"
+                    ))
+                }
+                Err(e) => format!("error: spawn bash: {e}"),
+            }
+        }
+        ToolCall::Write { path, body } => {
+            if let Some(parent) = std::path::Path::new(path).parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = tokio::fs::create_dir_all(parent).await;
+                }
+            }
+            match tokio::fs::write(path, body.as_bytes()).await {
+                Ok(()) => format!("wrote {} bytes to {path}", body.len()),
+                Err(e) => format!("error: write {path}: {e}"),
+            }
+        }
+    }
 }
 
 async fn stream_chat(
@@ -1287,6 +1944,15 @@ fn render_footer(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
         Span::styled("● idle", Style::default().fg(OK))
     };
 
+    let (conn_glyph, conn_text, conn_color) = match &s.connectivity {
+        None => ("◌", "probing…".to_string(), MUTED),
+        Some(r) => match r.connectivity() {
+            crate::doctor::Connectivity::Direct => ("●", r.short_summary(), OK),
+            crate::doctor::Connectivity::Relay => ("●", r.short_summary(), WARN),
+            crate::doctor::Connectivity::NoInternet => ("●", r.short_summary(), ERR),
+        },
+    };
+
     let status = Line::from(vec![
         Span::styled("  mesh: ", Style::default().fg(MUTED)),
         Span::raw(format!("{} peers", s.peers.len())),
@@ -1295,6 +1961,9 @@ fn render_footer(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
             Some(_) => "● up",
             None => "○ down",
         }),
+        Span::styled("   net: ", Style::default().fg(MUTED)),
+        Span::styled(conn_glyph.to_string(), Style::default().fg(conn_color)),
+        Span::raw(format!(" {conn_text}")),
         Span::styled("   last /status: ", Style::default().fg(MUTED)),
         Span::raw(rel_instant(&s.last_status_refresh)),
         Span::styled("   state: ", Style::default().fg(MUTED)),
@@ -1324,7 +1993,11 @@ fn render_footer(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
 fn render_tab_dashboard(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(10), Constraint::Min(6)])
+        .constraints([
+            Constraint::Length(10),
+            Constraint::Length(7),
+            Constraint::Min(4),
+        ])
         .split(area);
 
     let top = Layout::default()
@@ -1334,7 +2007,96 @@ fn render_tab_dashboard(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
 
     render_panel_self(f, top[0], s);
     render_panel_peers_summary(f, top[1], s);
-    render_panel_activity(f, rows[1], s);
+    render_panel_connectivity(f, rows[1], s);
+    render_panel_activity(f, rows[2], s);
+}
+
+fn render_panel_connectivity(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
+    let block = rounded_block(" Connectivity ");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let lines: Vec<Line> = match &s.connectivity {
+        None => vec![
+            Line::from(Span::styled(
+                format!(
+                    "  {} probing IPv6 / IPv4 / NAT type — first pairing prediction in ~5s…",
+                    spinner_char(s.spinner_frame)
+                ),
+                Style::default().fg(MUTED),
+            )),
+        ],
+        Some(r) => {
+            let (verdict_color, verdict_text) = match r.connectivity() {
+                crate::doctor::Connectivity::Direct => (
+                    OK,
+                    "✓ direct connection — pairing will skip relay".to_string(),
+                ),
+                crate::doctor::Connectivity::Relay => (
+                    WARN,
+                    "⚠ relay required — your NAT blocks hole-punching, traffic goes through n0 relays"
+                        .to_string(),
+                ),
+                crate::doctor::Connectivity::NoInternet => (
+                    ERR,
+                    "✗ no internet reachable — neither IPv6 nor public IPv4 works".to_string(),
+                ),
+            };
+
+            let ipv6_line = match (&r.ipv6, &r.ipv6_error) {
+                (Some(a), _) => format!("IPv6  ✓ {}", a),
+                (None, Some(_)) => "IPv6  ✗ no v6 route".to_string(),
+                (None, None) => "IPv6  ?".to_string(),
+            };
+            let ipv4_line = match (&r.ipv4_public, &r.ipv4_error) {
+                (Some(ip), _) => {
+                    let cgnat = r.cgnat.unwrap_or(false);
+                    if cgnat {
+                        format!("IPv4  ⚠ {ip}  (CGNAT)")
+                    } else {
+                        format!("IPv4  ✓ {ip}")
+                    }
+                }
+                (None, Some(_)) => "IPv4  ✗".to_string(),
+                (None, None) => "IPv4  ?".to_string(),
+            };
+            let nat_line = match (&r.nat_type, &r.nat_error) {
+                (Some(crate::doctor::NatVerdict::EndpointIndependent { .. }), _) => {
+                    "NAT   ✓ endpoint-independent — hole-punch works".to_string()
+                }
+                (Some(crate::doctor::NatVerdict::Symmetric { .. }), _) => {
+                    "NAT   ✗ symmetric — hole-punch fails, must relay".to_string()
+                }
+                (None, Some(_)) => "NAT   ?".to_string(),
+                (None, None) => "NAT   ?".to_string(),
+            };
+
+            vec![
+                Line::from(Span::styled(
+                    format!("  {verdict_text}"),
+                    Style::default().fg(verdict_color).add_modifier(Modifier::BOLD),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("    {ipv6_line}"),
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    format!("    {ipv4_line}"),
+                    Style::default().fg(MUTED),
+                )),
+                Line::from(Span::styled(
+                    format!("    {nat_line}"),
+                    Style::default().fg(MUTED),
+                )),
+            ]
+        }
+    };
+
+    f.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: false }),
+        inner.inner(Margin { horizontal: 1, vertical: 0 }),
+    );
 }
 
 fn render_panel_self(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
@@ -1482,17 +2244,21 @@ fn render_tab_chat(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
         .split(area);
 
     // chat history
-    let block = rounded_block(" Chat ");
+    let title = match s.chat_mode {
+        ChatMode::Chat => " Chat · type /code to switch to Code mode ".to_string(),
+        ChatMode::Code => " Chat · mode: CODE (agent · reads/edits files, runs shell) · /chat to switch back ".to_string(),
+    };
+    let block = rounded_block(&title);
     let inner = block.inner(rows[0]);
     f.render_widget(block, rows[0]);
 
     let width = inner.width.saturating_sub(10) as usize;
     let mut lines: Vec<Line> = Vec::new();
     for turn in &s.chat {
-        let (prefix, colour) = if turn.role == "user" {
-            (" you ▸  ", OK)
-        } else {
-            (" asst ◂ ", ACCENT)
+        let (prefix, colour) = match turn.role.as_str() {
+            "user" => (" you  ▸ ", OK),
+            "tool_result" => (" tool ◂ ", WARN),
+            _ => (" asst ◂ ", ACCENT),
         };
         let wrapped = wrap_text(&turn.content, width);
         for (i, l) in wrapped.iter().enumerate() {
@@ -1524,13 +2290,41 @@ fn render_tab_chat(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
         lines.push(Line::from(""));
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  type a prompt below and press Enter",
-            Style::default().fg(MUTED),
-        )));
+        match s.chat_mode {
+            ChatMode::Chat => {
+                lines.push(Line::from(Span::styled(
+                    "  type a prompt below and press Enter",
+                    Style::default().fg(MUTED),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  /code   — switch to Code mode (in-UI coding agent · file + shell tools)",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::DIM),
+                )));
+            }
+            ChatMode::Code => {
+                lines.push(Line::from(Span::styled(
+                    "  CODE MODE — describe a coding task and the model will use tools:",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "    <read path=…/>    <list path=…/>    <bash>…</bash>    <write path=…>…</write>    <done/>",
+                    Style::default().fg(MUTED),
+                )));
+                lines.push(Line::from(""));
+                lines.push(Line::from(Span::styled(
+                    "  Tool calls run in your current directory. No confirmation prompts — be specific.",
+                    Style::default().fg(WARN).add_modifier(Modifier::DIM),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "  /chat   — switch back to plain Chat mode",
+                    Style::default().fg(MUTED).add_modifier(Modifier::DIM),
+                )));
+            }
+        }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "  Ctrl-L clears history · Ctrl-C quits",
+            "  /clear clears history · /help shows all keys · Ctrl-C quits",
             Style::default().fg(MUTED).add_modifier(Modifier::DIM),
         )));
     }
@@ -1791,7 +2585,6 @@ fn render_tab_models(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
             Compat::Recommended => OK,
             Compat::Tight => WARN,
             Compat::NeedsBigger => MUTED,
-            Compat::UnsupportedArch | Compat::Blocked => ERR,
         };
         lines.push(Line::from(vec![
             prefix,
@@ -1852,10 +2645,17 @@ fn render_tab_help(f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(block, area);
 
     let rows: Vec<(&str, &str)> = vec![
-        ("← / → or Tab / Shift-Tab", "cycle tabs  (works inside Chat too)"),
+        ("Tab / Shift-Tab", "cycle tabs  (works inside Chat too)"),
         ("1 / 2 / 3 / 4 / 5", "jump to Dashboard / Chat / Peers / Models / Help"),
+        ("← / →", "cycle tabs  (or filter on Models tab)"),
+        ("↑ / ↓ (Models)", "move cursor through model list"),
+        ("D (Models)", "delete selected installed model"),
         ("Enter (Chat)", "send prompt"),
-        ("Ctrl-L (Chat)", "clear chat history"),
+        ("/code  (Chat)", "switch to Code mode (in-UI coding agent)"),
+        ("/chat  (Chat)", "switch back to plain Chat mode"),
+        ("/clear (Chat)", "clear chat history"),
+        ("Ctrl-L (Chat)", "clear chat history (alt)"),
+        ("Ctrl-O (Chat)", "toggle Chat / Code mode (alt)"),
         ("P (Peers)", "pair this device — shows invite string"),
         ("J (Peers)", "join another device — paste an invite"),
         ("Ctrl-R", "force an immediate peer-ping round"),

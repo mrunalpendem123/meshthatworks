@@ -1,0 +1,101 @@
+Tap top-k expert indices from Qwen3-MoE forward pass.
+
+Source data for `mtw-cache::ActivationHistogram`. When `MTW_EXPERT_LOG` is
+set in the environment, every MoE forward writes one line per layer per
+batch:
+
+  [mtw-expert] layer=<L> indices=[i,j,...]\n
+
+Indices are flattened across `[batch, seq, top_k]` — caller groups them.
+When `MTW_EXPERT_LOG` is unset, the tap is a single env lookup → zero
+overhead per token (cached on first call).
+
+Apply from `mlx-swift-lm/` root:
+  cd ~/Desktop/meshthatworks-deps/SwiftLM/mlx-swift-lm
+  patch -p1 < ../../meshthatworks/patches/qwen3moe-expert-tap.patch
+
+Then rebuild SwiftLM:
+  cd ~/Desktop/meshthatworks-deps/SwiftLM
+  swift build -c release
+
+Run with the tap on:
+  MTW_EXPERT_LOG=/tmp/mtw-experts.log mtw serve --model ...
+
+The logs `[mtw-expert]` lines tell `mtw-cache` which experts fire on
+which prompts, feeding `ActivationHistogram::record_prompt`.
+
+--- a/Libraries/MLXLLM/Models/Qwen3MoE.swift
++++ b/Libraries/MLXLLM/Models/Qwen3MoE.swift
+@@ -110,6 +110,33 @@ public class Qwen3MoEMLP: Module, UnaryLayer {
+     }
+ }
+
++// MARK: - mtw expert tap
++// Cached once per process: the path to write `[mtw-expert] layer=L indices=[...]`
++// lines to. When unset, the tap costs one env lookup per process and nothing
++// per token. See ../../meshthatworks/patches/qwen3moe-expert-tap.patch.
++private let mtwExpertLogPath: String? = ProcessInfo.processInfo.environment["MTW_EXPERT_LOG"]
++private let mtwExpertLogQueue = DispatchQueue(label: "mtw.expert.log")
++
++@inline(__always)
++private func mtwLogExpertIndices(layer: Int, inds: MLXArray) {
++    guard let path = mtwExpertLogPath else { return }
++    // Force materialization, then format. The asArray call syncs MLX, but
++    // the tap is opt-in so the cost only lands when explicitly enabled.
++    let flat = inds.asArray(Int32.self)
++    var line = "[mtw-expert] layer=\(layer) indices=["
++    for (i, v) in flat.enumerated() {
++        if i > 0 { line.append(",") }
++        line.append(String(v))
++    }
++    line.append("]\n")
++    mtwExpertLogQueue.async {
++        if let h = FileHandle(forWritingAtPath: path) ?? {
++            FileManager.default.createFile(atPath: path, contents: nil)
++            return FileHandle(forWritingAtPath: path)
++        }() {
++            h.seekToEndOfFile(); try? h.write(contentsOf: line.data(using: .utf8) ?? Data())
++            try? h.close()
++        }
++    }
++}
++
+ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+     let numExperts: Int
+     let topK: Int
+@@ -118,7 +145,9 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+     @ModuleInfo(key: "gate") var gate: Linear
+     @ModuleInfo(key: "switch_mlp") var switchMLP: SwitchGLU
+
+-    init(_ args: Qwen3MoEConfiguration) {
++    let layerIdx: Int
++
++    init(_ args: Qwen3MoEConfiguration, layerIdx: Int = -1) {
+         self.numExperts = args.numExperts
+         self.topK = {
+             if let override = ProcessInfo.processInfo.environment["SWIFTLM_TOP_K"],
+@@ -130,6 +159,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+             return args.numExpertsPerToken
+         }()
+         self.normTopkProb = args.normTopkProb
++        self.layerIdx = layerIdx
+
+         _gate.wrappedValue = Linear(args.hiddenSize, numExperts, bias: false)
+         _switchMLP.wrappedValue = SwitchGLU(
+@@ -143,6 +173,7 @@ class Qwen3MoESparseMoeBlock: Module, UnaryLayer {
+
+         let k = topK
+         let inds = MLX.argPartition(-gates, kth: k - 1, axis: -1)[.ellipsis, ..<k]
++        mtwLogExpertIndices(layer: layerIdx, inds: inds)
+         var scores = MLX.takeAlong(softGates, inds, axis: -1)
+
+         if normTopkProb {
+@@ -176,7 +207,7 @@ class Qwen3MoeDecoderLayer: Module {
+         if !args.mlpOnlyLayers.contains(layerIdx),
+             args.numExperts > 0, (layerIdx + 1) % args.decoderSparseStep == 0
+         {
+-            self.mlp = Qwen3MoESparseMoeBlock(args)
++            self.mlp = Qwen3MoESparseMoeBlock(args, layerIdx: layerIdx)
+         } else {
+             self.mlp = Qwen3MoEMLP(
+                 dimensions: args.hiddenSize, hiddenDimensions: args.intermediateSize)
