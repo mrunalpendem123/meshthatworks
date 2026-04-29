@@ -19,16 +19,19 @@ No cloud. No accounts. Your prompts and your data stay on your machines.
 
 ## Quickstart
 
-Three commands. The first one takes ~30 minutes the first time (it builds SwiftLM); the others are seconds.
+Three commands. The first takes ~30 minutes the first time (it builds SwiftLM); the others are seconds.
 
 ```bash
 # 1. Install — clones, builds, sets up ~/.local/bin/mtw
 curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
 
-# 2. Pick a model — opens the dashboard's Models tab, choose one, hit Enter
+# 2. Pick a model — opens the dashboard's Models tab.
+#    Press 4 to go to Models, ↑/↓ to select, Enter to use.
+#    If the model is not on disk yet, Enter downloads it from Hugging Face,
+#    then sets it as your active model. Press q to quit the dashboard.
 mtw dashboard
 
-# 3. Run — engine + dashboard in one terminal, Ctrl-C to stop
+# 3. Run — engine + live dashboard in one terminal, Ctrl-C to stop.
 mtw start
 ```
 
@@ -40,6 +43,8 @@ export OPENAI_API_KEY=local
 ```
 
 That's it. The rest of this README is for when you want to know *how* and *why*.
+
+> **Two devices?** Both need the *same* model. After step 2 on device A, run the same `mtw dashboard → Models → Enter` flow on device B and pick the same row. Then pair them on the Peers tab (`P` on one, `J` on the other with the invite). Auto-coordination of model choice across paired devices is on the roadmap.
 
 ---
 
@@ -297,12 +302,14 @@ Total disk: about 1.5 GB (Rust toolchain, SwiftLM build artifacts).
 mtw dashboard
 ```
 
-Hit `4` to go to the **Models** tab. You see two lists:
+Hit `4` to go to the **Models** tab. Two lists:
 
-- **Installed** — models already on disk under `~/.meshthatworks-deps/models/`. Pick one with `D` to delete and free disk.
-- **Available** — a curated catalog from `mlx-community` on Hugging Face, filtered by use case (general chat, coding, vision, small/fast). Hit Enter on a row to download — the dashboard streams the safetensors and config files into `~/.meshthatworks-deps/models/<name>/`.
+- **Installed** — models already on disk under `~/.meshthatworks-deps/models/`. Use the cursor (`↑/↓`) and `Enter` to set one as the active model. `D` deletes one to free disk.
+- **Available** — a curated catalog from `mlx-community` on Hugging Face, filtered by use case (general / coding / writing / reasoning / tiny / heavy). `Enter` on an available row streams every file in the repo into `~/.meshthatworks-deps/models/<name>/` and then sets that model as active.
 
-For a first run, pick something small (1–4 GB) so you can see the system end-to-end without waiting on a 20 GB download. **OLMoE-1B-7B-0125-Instruct-4bit** (3.6 GB) is a good MoE starter. **Qwen3-Coder-30B-A3B-4bit** (~18 GB) is the eventual target.
+What "active" means: the dashboard writes your choice to `~/.mtw/active-model`. The next `mtw start` (or `mtw serve` with no `--model` flag) reads from that file, so you only pick once. The active row is marked `★ active`. The model the engine has actually loaded right now is marked `[loaded]` — they are the same once you restart.
+
+For a first run, pick something small (1–4 GB) to see the system end-to-end without waiting on a 20 GB download. **OLMoE-1B-7B-0125-Instruct-4bit** (3.6 GB) is a good MoE starter. **Qwen3-Coder-30B-A3B-4bit** (~18 GB) is the eventual target.
 
 ---
 

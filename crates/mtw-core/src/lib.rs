@@ -3,6 +3,7 @@
 //! Owns peer discovery, shard assignment, and inference request routing
 //! across the home mesh. Uses iroh for transport and identity.
 
+pub mod active_model;
 pub mod echo;
 pub mod health;
 pub mod identity;

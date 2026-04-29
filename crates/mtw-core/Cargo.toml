@@ -22,3 +22,6 @@ bincode.workspace = true
 rand.workspace = true
 async-trait.workspace = true
 mtw-engine.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

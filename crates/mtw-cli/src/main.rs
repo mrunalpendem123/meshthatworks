@@ -27,7 +27,13 @@ pub fn default_swiftlm_binary() -> PathBuf {
     default_deps_dir().join("SwiftLM/.build/arm64-apple-macosx/release/SwiftLM")
 }
 
+/// Resolution order for the model directory:
+///   1. ~/.mtw/active-model (set by the dashboard's Models tab)
+///   2. fallback: ~/.meshthatworks-deps/models/OLMoE-1B-7B-0125-Instruct-4bit
 pub fn default_model_dir() -> PathBuf {
+    if let Ok(Some(p)) = mtw_core::active_model::load() {
+        return p;
+    }
     default_deps_dir().join("models/OLMoE-1B-7B-0125-Instruct-4bit")
 }
 

@@ -215,6 +215,10 @@ struct SharedState {
     /// Index into a flat (installed ++ filtered_catalog) list for selection
     models_cursor: usize,
     models_filter: Category,
+    /// `~/.mtw/active-model` value at the last refresh — the model the next
+    /// `mtw start` will load. May differ from `node.model.name` (which is
+    /// the model the *running* engine has loaded).
+    active_model_dir: Option<std::path::PathBuf>,
 
     chat: Vec<ChatTurn>,
     input: String,
@@ -262,6 +266,7 @@ impl SharedState {
             installed: self.installed.clone(),
             models_cursor: self.models_cursor,
             models_filter: self.models_filter,
+            active_model_dir: self.active_model_dir.clone(),
             chat: self.chat.clone(),
             input: self.input.clone(),
             streaming: self.streaming,
@@ -600,23 +605,23 @@ async fn handle_key(
             }
             KeyCode::Enter => {
                 let s = state.lock().await;
-                let avail: Vec<&CatalogModel> =
-                    CATALOG.iter().filter(|m| m.matches(s.models_filter)).collect();
-                let cursor_in_avail = s.models_cursor.checked_sub(s.installed.len());
-                if let Some(idx) = cursor_in_avail {
-                    if let Some(m) = avail.get(idx) {
-                        let repo = m.hf_repo;
-                        let dir = m.dir_name;
+                let cursor = s.models_cursor;
+                if cursor < s.installed.len() {
+                    // Installed model — set as active.
+                    let m = s.installed[cursor].clone();
+                    drop(s);
+                    set_active_model_action(state.clone(), m.abs_path, m.dir_name).await;
+                } else {
+                    // Catalog model — download then set as active.
+                    let avail: Vec<CatalogModel> = CATALOG
+                        .iter()
+                        .copied()
+                        .filter(|m| m.matches(s.models_filter))
+                        .collect();
+                    let idx = cursor - s.installed.len();
+                    if let Some(m) = avail.get(idx).copied() {
                         drop(s);
-                        let mut s = state.lock().await;
-                        s.push_activity(
-                            ActivityKind::Info,
-                            format!("install: {} → ~/Desktop/meshthatworks-deps/models/{}", repo, dir),
-                        );
-                        s.push_activity(
-                            ActivityKind::Info,
-                            "(in-TUI download not built yet — see Help for the curl command)",
-                        );
+                        download_and_activate(state.clone(), m).await;
                     }
                 }
                 return false;
@@ -922,6 +927,161 @@ async fn confirm_delete(state: Arc<Mutex<SharedState>>) {
         }
     }
     s.overlay = Overlay::None;
+}
+
+// ---------------------------------------------------------- model picker
+
+/// Persist `path` as the active model (`~/.mtw/active-model`). Logs to the
+/// activity feed. Restart `mtw start` to actually load it — the engine is
+/// constructed once at startup, so a live swap is a future feature.
+async fn set_active_model_action(
+    state: Arc<Mutex<SharedState>>,
+    path: std::path::PathBuf,
+    dir_name: String,
+) {
+    match mtw_core::active_model::set(&path) {
+        Ok(()) => {
+            let mut s = state.lock().await;
+            s.push_activity(
+                ActivityKind::Ok,
+                format!(
+                    "active model: {} — restart `mtw start` to load it",
+                    dir_name
+                ),
+            );
+        }
+        Err(e) => {
+            let mut s = state.lock().await;
+            s.push_activity(
+                ActivityKind::Err,
+                format!("set active model: {e}"),
+            );
+        }
+    }
+}
+
+/// Download a catalog model from Hugging Face into
+/// `~/.meshthatworks-deps/models/<dir>/`, then set it as active. Streams
+/// each file with progress lines into the activity feed. Tolerates files
+/// (e.g. `generation_config.json`) that may not exist for every repo.
+async fn download_and_activate(state: Arc<Mutex<SharedState>>, m: CatalogModel) {
+    let dest = match std::env::var_os("HOME") {
+        Some(home) => std::path::PathBuf::from(home)
+            .join(".meshthatworks-deps/models")
+            .join(m.dir_name),
+        None => {
+            state.lock().await.push_activity(
+                ActivityKind::Err,
+                "$HOME not set — cannot pick install dir",
+            );
+            return;
+        }
+    };
+
+    if dest.join("config.json").is_file() && dest.join("model.safetensors").is_file() {
+        // Already there — just set active.
+        set_active_model_action(state.clone(), dest, m.dir_name.into()).await;
+        return;
+    }
+
+    state.lock().await.push_activity(
+        ActivityKind::Info,
+        format!("downloading {} (~{:.1} GB) — this happens once", m.name, m.size_gb),
+    );
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = std::fs::create_dir_all(&dest) {
+            state_clone.lock().await.push_activity(
+                ActivityKind::Err,
+                format!("create model dir: {e}"),
+            );
+            return;
+        }
+        match list_hf_files(m.hf_repo).await {
+            Ok(files) => {
+                let total_files = files.len();
+                for (i, file) in files.iter().enumerate() {
+                    let dest_file = dest.join(file);
+                    if dest_file.is_file() {
+                        continue;
+                    }
+                    let url = format!(
+                        "https://huggingface.co/{}/resolve/main/{}",
+                        m.hf_repo, file
+                    );
+                    state_clone.lock().await.push_activity(
+                        ActivityKind::Info,
+                        format!("  [{}/{}] fetching {file}", i + 1, total_files),
+                    );
+                    if let Err(e) = stream_to_file(&url, &dest_file).await {
+                        state_clone.lock().await.push_activity(
+                            ActivityKind::Err,
+                            format!("  download {file}: {e}"),
+                        );
+                        return;
+                    }
+                }
+                state_clone.lock().await.push_activity(
+                    ActivityKind::Ok,
+                    format!("downloaded {}", m.name),
+                );
+                set_active_model_action(state_clone, dest, m.dir_name.into()).await;
+            }
+            Err(e) => {
+                state_clone.lock().await.push_activity(
+                    ActivityKind::Err,
+                    format!("list files for {}: {e}", m.hf_repo),
+                );
+            }
+        }
+    });
+}
+
+/// Hit `https://huggingface.co/api/models/<repo>/tree/main` and return the
+/// list of file paths. Skips entries that are directories.
+async fn list_hf_files(repo: &str) -> anyhow::Result<Vec<String>> {
+    #[derive(serde::Deserialize)]
+    struct Entry {
+        #[serde(rename = "type")]
+        kind: String,
+        path: String,
+    }
+    let url = format!("https://huggingface.co/api/models/{repo}/tree/main");
+    let entries: Vec<Entry> = reqwest::Client::new()
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(entries
+        .into_iter()
+        .filter(|e| e.kind == "file")
+        .map(|e| e.path)
+        .collect())
+}
+
+/// Stream a URL to `dest`. Atomic via .part suffix + rename so a crashed
+/// download leaves no half-file at the destination.
+async fn stream_to_file(url: &str, dest: &std::path::Path) -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let part = dest.with_extension("part");
+    let resp = reqwest::Client::new()
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?;
+    let mut stream = resp.bytes_stream();
+    let mut file = tokio::fs::File::create(&part).await?;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    drop(file);
+    tokio::fs::rename(&part, dest).await?;
+    Ok(())
 }
 
 async fn submit_join(state: Arc<Mutex<SharedState>>) {
@@ -1768,7 +1928,7 @@ async fn refresh_loop(
         // installed models on disk
         if let Some(home) = std::env::var_os("HOME") {
             let dir = std::path::Path::new(&home)
-                .join("Desktop/meshthatworks-deps/models");
+                .join(".meshthatworks-deps/models");
             if let Ok(entries) = std::fs::read_dir(&dir) {
                 let mut found: Vec<InstalledModel> = Vec::new();
                 for e in entries.flatten() {
@@ -1791,6 +1951,10 @@ async fn refresh_loop(
                 state.lock().await.installed = found;
             }
         }
+
+        // active model setting (`~/.mtw/active-model`)
+        let active = mtw_core::active_model::load().ok().flatten();
+        state.lock().await.active_model_dir = active;
 
         // peers.json
         match mtw_core::peers::load() {
@@ -2674,15 +2838,26 @@ fn render_tab_models(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
             } else {
                 Span::raw("    ")
             };
-            let active = s
+            let loaded = s
                 .node
                 .as_ref()
                 .map(|n| n.model.name == m.dir_name)
                 .unwrap_or(false);
-            let active_tag = if active {
+            let picked = s
+                .active_model_dir
+                .as_ref()
+                .and_then(|p| p.file_name().and_then(|s| s.to_str()))
+                .map(|name| name == m.dir_name)
+                .unwrap_or(false);
+            let active_tag = if loaded {
                 Span::styled(
-                    "  [active]",
+                    "  [loaded]",
                     Style::default().fg(OK).add_modifier(Modifier::BOLD),
+                )
+            } else if picked {
+                Span::styled(
+                    "  ★ active",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
                 )
             } else {
                 Span::raw("")
@@ -2763,7 +2938,7 @@ fn render_tab_models(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
 
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "  ↑/↓ select   D delete (installed only)   ←/→ filter   Enter copy install command",
+        "  ↑/↓ select   Enter use this model (downloads if needed)   D delete   ←/→ filter",
         Style::default().fg(MUTED),
     )));
 
@@ -2797,6 +2972,7 @@ fn render_tab_help(f: &mut ratatui::Frame, area: Rect) {
         ("1 / 2 / 3 / 4 / 5", "jump to Dashboard / Chat / Peers / Models / Help"),
         ("← / →", "cycle tabs  (or filter on Models tab)"),
         ("↑ / ↓ (Models)", "move cursor through model list"),
+        ("Enter (Models)", "use selected model — downloads from HF if not installed, then sets it as active for next mtw start"),
         ("D (Models)", "delete selected installed model"),
         ("Enter (Chat)", "send prompt"),
         ("/code  (Chat)", "switch to Code mode (in-UI coding agent)"),
