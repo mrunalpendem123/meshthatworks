@@ -21,24 +21,23 @@ No cloud. No accounts. Your prompts and your data stay on your machines.
 curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
 ```
 
-The installer checks for Rust and git, clones the repo, builds the engine, and installs `mtw` to `~/.local/bin`. First build takes a few minutes.
+This installs Rust if missing, clones the repo, clones and builds [SwiftLM](https://github.com/SharpAI/SwiftLM), downloads a 3.6 GB starter model, builds `mtw`, and runs `mtw doctor` so you can see the result. You need Xcode for the SwiftLM build — the installer tells you if it is missing. First run is around 30 minutes and uses ~5 GB of disk.
 
 ## Run it
 
 ```
-mtw doctor
-mtw serve
+mtw start
 ```
 
-`mtw doctor` reports what is set up and what is still missing. `mtw serve` starts the local node — it spawns the inference engine, exposes an OpenAI-compatible API on `localhost:9337`, and joins the mesh over QUIC.
+That is the whole flow. It launches the engine in the background, waits for it to come up, and opens the live dashboard in the same terminal. Hit Ctrl-C to stop both.
 
-Want a live view?
+If you want to look around first:
 
 ```
-mtw dashboard
+mtw doctor      # what is set up, what is missing, and the next command
+mtw serve       # just the engine, no dashboard
+mtw dashboard   # just the dashboard, attaches to a running engine
 ```
-
-You see the chat, the peers, throughput, and a model picker — all in your terminal.
 
 ## Use it from any tool
 

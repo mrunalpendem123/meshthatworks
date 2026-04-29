@@ -14,12 +14,22 @@ use mtw_engine::{
     swiftlm::SwiftLMOptions,
 };
 
-const DEFAULT_SWIFTLM_BINARY: &str =
-    "/Users/mrunalpendem/Desktop/meshthatworks-deps/SwiftLM/.build/release/SwiftLM";
-const DEFAULT_MODEL_DIR: &str =
-    "/Users/mrunalpendem/Desktop/meshthatworks-deps/models/Qwen3-30B-A3B-4bit";
 const DEFAULT_SWIFTLM_PORT: u16 = 9876;
 const DEFAULT_PROXY_PORT: u16 = 9337;
+
+/// `~/.meshthatworks-deps` — where bootstrap.sh installs SwiftLM and downloads models.
+pub fn default_deps_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join(".meshthatworks-deps")
+}
+
+pub fn default_swiftlm_binary() -> PathBuf {
+    default_deps_dir().join("SwiftLM/.build/arm64-apple-macosx/release/SwiftLM")
+}
+
+pub fn default_model_dir() -> PathBuf {
+    default_deps_dir().join("models/OLMoE-1B-7B-0125-Instruct-4bit")
+}
 
 #[derive(Parser)]
 #[command(
@@ -38,11 +48,13 @@ enum Command {
     /// exposes an OpenAI-compatible HTTP proxy on port 9337.
     Serve {
         /// Path to the model directory (must contain config.json + safetensors).
-        #[arg(long, default_value = DEFAULT_MODEL_DIR)]
-        model: PathBuf,
-        /// Path to the SwiftLM binary.
-        #[arg(long, default_value = DEFAULT_SWIFTLM_BINARY)]
-        swiftlm: PathBuf,
+        /// Defaults to `~/.meshthatworks-deps/models/OLMoE-1B-7B-0125-Instruct-4bit`.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Path to the SwiftLM binary. Defaults to
+        /// `~/.meshthatworks-deps/SwiftLM/.build/arm64-apple-macosx/release/SwiftLM`.
+        #[arg(long)]
+        swiftlm: Option<PathBuf>,
         /// Port SwiftLM listens on internally.
         #[arg(long, default_value_t = DEFAULT_SWIFTLM_PORT)]
         swiftlm_port: u16,
@@ -86,6 +98,19 @@ enum Command {
     /// NAT type (via STUN), and macOS firewall state. Predicts whether pairing
     /// will be direct or fall back to relay.
     Doctor,
+    /// One-command launch: starts the engine in the background, waits for
+    /// it to be ready, and opens the live dashboard. Ctrl-C stops both.
+    Start {
+        /// Path to the model directory.
+        #[arg(long)]
+        model: Option<PathBuf>,
+        /// Path to the SwiftLM binary.
+        #[arg(long)]
+        swiftlm: Option<PathBuf>,
+        /// GPU memory limit for SwiftLM (MB).
+        #[arg(long, default_value_t = 4096)]
+        mem_limit: u32,
+    },
     /// Launch a terminal UI that shows this node's state and its peers.
     Dashboard {
         /// Base URL of the mtw-api proxy to query for /status.
@@ -146,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
     // terminal, serve's stderr paints over the dashboard. Send serve's logs to
     // a file too. Short-lived commands (pair/join/status/...) keep stderr.
     match cli.command {
-        Command::Dashboard { .. } => {
+        Command::Dashboard { .. } | Command::Start { .. } => {
             init_tracing_file("/tmp/mtw-dashboard.log")?;
         }
         Command::Serve { .. } => {
@@ -169,8 +194,8 @@ async fn main() -> anyhow::Result<()> {
             num_draft_tokens,
         } => {
             serve_cmd(ServeArgs {
-                model,
-                swiftlm,
+                model: model.unwrap_or_else(default_model_dir),
+                swiftlm: swiftlm.unwrap_or_else(default_swiftlm_binary),
                 swiftlm_port,
                 proxy_port,
                 mem_limit,
@@ -200,6 +225,18 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Peers => peers_cmd(),
         Command::Doctor => doctor::run().await,
+        Command::Start {
+            model,
+            swiftlm,
+            mem_limit,
+        } => {
+            start_cmd(StartArgs {
+                model: model.unwrap_or_else(default_model_dir),
+                swiftlm: swiftlm.unwrap_or_else(default_swiftlm_binary),
+                mem_limit,
+            })
+            .await
+        }
         Command::Dashboard {
             url,
             tick_ms,
@@ -427,6 +464,92 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     // Grace period for the child to receive SIGKILL and exit.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     result
+}
+
+struct StartArgs {
+    model: PathBuf,
+    swiftlm: PathBuf,
+    mem_limit: u32,
+}
+
+/// `mtw start` — one-command flow: spawn `mtw serve` in the background, wait
+/// for it to be ready, then open the dashboard. Ctrl-C in the dashboard
+/// brings both down.
+async fn start_cmd(args: StartArgs) -> anyhow::Result<()> {
+    if !args.swiftlm.is_file() {
+        eprintln!("mtw start: SwiftLM binary not found at {}", args.swiftlm.display());
+        eprintln!();
+        eprintln!("Run  mtw doctor  for setup instructions, or pass --swiftlm <path>.");
+        anyhow::bail!("missing SwiftLM");
+    }
+    if !args.model.is_dir() || !args.model.join("config.json").is_file() {
+        eprintln!("mtw start: model directory not found at {}", args.model.display());
+        eprintln!();
+        eprintln!("Run  mtw doctor  for setup instructions, or pass --model <path>.");
+        anyhow::bail!("missing model");
+    }
+
+    println!("mtw start: launching engine + dashboard…");
+    println!("  model:  {}", args.model.display());
+    println!("  engine: {}", args.swiftlm.display());
+    println!();
+
+    let serve_args = ServeArgs {
+        model: args.model.clone(),
+        swiftlm: args.swiftlm.clone(),
+        swiftlm_port: DEFAULT_SWIFTLM_PORT,
+        proxy_port: DEFAULT_PROXY_PORT,
+        mem_limit: args.mem_limit,
+        mock: false,
+        attach: None,
+        draft_model: None,
+        num_draft_tokens: 4,
+    };
+    let serve_handle = tokio::spawn(serve_cmd(serve_args));
+
+    let healthz = format!("http://127.0.0.1:{}/healthz", DEFAULT_PROXY_PORT);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(2))
+        .build()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
+    println!("waiting for engine to come up (model load can take ~30s cold)…");
+    loop {
+        if serve_handle.is_finished() {
+            return match serve_handle.await {
+                Ok(Ok(())) => anyhow::bail!("mtw serve exited before becoming ready"),
+                Ok(Err(e)) => Err(e.context("mtw serve failed during startup")),
+                Err(je) => anyhow::bail!("serve task crashed: {je}"),
+            };
+        }
+        if client
+            .get(&healthz)
+            .send()
+            .await
+            .map(|r| r.status().is_success())
+            .unwrap_or(false)
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            serve_handle.abort();
+            anyhow::bail!("mtw serve did not become ready within 300s");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    println!("✓ engine ready — opening dashboard (Ctrl-C to stop)");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let dashboard_args = dashboard::DashboardArgs {
+        url: format!("http://127.0.0.1:{}", DEFAULT_PROXY_PORT),
+        tick: std::time::Duration::from_millis(500),
+        ping_every: std::time::Duration::from_secs(10),
+    };
+    let dashboard_result = dashboard::run(dashboard_args).await;
+
+    serve_handle.abort();
+    let _ = serve_handle.await;
+    dashboard_result
 }
 
 fn preflight_port(port: u16, label: &str) -> anyhow::Result<()> {

@@ -114,14 +114,145 @@ impl Report {
 }
 
 pub async fn run() -> anyhow::Result<()> {
-    println!("mtw doctor — connectivity check");
-    println!();
-    println!("running probes (~5–10s)…");
+    println!("mtw doctor — environment check");
     println!();
 
+    let local = check_local_setup();
+    print_local(&local);
+
+    println!();
+    println!("running network probes (~5–10s)…");
+    println!();
     let report = collect().await;
     render(&report);
+
+    println!();
+    print_next_step(&local);
     Ok(())
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalSetup {
+    pub mtw_on_path: bool,
+    pub xcode_metal: bool,
+    pub xcode_metal_err: Option<String>,
+    pub swiftlm_built: bool,
+    pub swiftlm_path: std::path::PathBuf,
+    pub model_present: bool,
+    pub model_path: std::path::PathBuf,
+}
+
+pub fn check_local_setup() -> LocalSetup {
+    let swiftlm_path = crate::default_swiftlm_binary();
+    let model_path = crate::default_model_dir();
+
+    // mtw is the binary that's currently running, so it's on PATH iff `which mtw`
+    // resolves to anything. We don't strictly need this to be on PATH for the
+    // user — but it's handy to flag.
+    let mtw_on_path = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v mtw")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let metal_check = std::process::Command::new("xcrun")
+        .args(["-sdk", "macosx", "metal", "--version"])
+        .output();
+    let (xcode_metal, xcode_metal_err) = match metal_check {
+        Ok(o) if o.status.success() => (true, None),
+        Ok(o) => (
+            false,
+            Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        ),
+        Err(e) => (false, Some(format!("{e}"))),
+    };
+
+    let swiftlm_built = swiftlm_path.is_file()
+        && std::fs::metadata(&swiftlm_path)
+            .map(|m| m.permissions().readonly() == false || true) // existence is enough
+            .unwrap_or(false);
+
+    let model_present = model_path.join("config.json").is_file()
+        && model_path.join("model.safetensors").is_file();
+
+    LocalSetup {
+        mtw_on_path,
+        xcode_metal,
+        xcode_metal_err,
+        swiftlm_built,
+        swiftlm_path,
+        model_present,
+        model_path,
+    }
+}
+
+fn print_local(s: &LocalSetup) {
+    fn pad(label: &str) -> String {
+        format!("  {label:<16}")
+    }
+    println!("local setup");
+    print!("{}", pad("mtw on PATH"));
+    if s.mtw_on_path {
+        println!("✓");
+    } else {
+        println!("✗  add ~/.local/bin to PATH:  echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc");
+    }
+    print!("{}", pad("Xcode + Metal"));
+    if s.xcode_metal {
+        println!("✓");
+    } else {
+        let hint = match &s.xcode_metal_err {
+            Some(e) if e.contains("xcode-select") => {
+                "install Xcode from the App Store, then: xcodebuild -downloadComponent MetalToolchain"
+            }
+            _ => "install Xcode + run: xcodebuild -downloadComponent MetalToolchain",
+        };
+        println!("✗  {hint}");
+    }
+    print!("{}", pad("SwiftLM binary"));
+    if s.swiftlm_built {
+        println!("✓  {}", s.swiftlm_path.display());
+    } else {
+        println!(
+            "✗  not at {}. Run scripts/bootstrap.sh, or build manually: \
+             git clone https://github.com/SharpAI/SwiftLM ~/.meshthatworks-deps/SwiftLM \
+             && cd ~/.meshthatworks-deps/SwiftLM && swift build -c release",
+            s.swiftlm_path.display()
+        );
+    }
+    print!("{}", pad("Model"));
+    if s.model_present {
+        println!("✓  {}", s.model_path.display());
+    } else {
+        println!(
+            "✗  no model at {}. Download with scripts/bootstrap.sh, or fetch from Hugging Face mlx-community.",
+            s.model_path.display()
+        );
+    }
+}
+
+fn print_next_step(s: &LocalSetup) {
+    println!("──────────────────────────────────────────────────────────");
+    if !s.xcode_metal {
+        println!("Next: install Xcode (App Store) + the Metal toolchain.");
+        println!("       xcodebuild -downloadComponent MetalToolchain");
+        return;
+    }
+    if !s.swiftlm_built {
+        println!("Next: run the bootstrap to clone & build SwiftLM (~30 min).");
+        println!("       curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh");
+        return;
+    }
+    if !s.model_present {
+        println!("Next: download a starter model (~3.6 GB).");
+        println!("       scripts/bootstrap.sh   # or pass --model /path/to/your-model to mtw serve");
+        return;
+    }
+    println!("Everything is set up. ✨");
+    println!();
+    println!("Next: run  mtw start");
+    println!("       (this spawns the engine and opens the live dashboard)");
 }
 
 pub async fn collect() -> Report {
