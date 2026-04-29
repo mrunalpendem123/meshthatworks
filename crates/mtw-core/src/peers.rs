@@ -57,3 +57,15 @@ pub fn record(id: &str) -> anyhow::Result<()> {
     }
     save(&list)
 }
+
+/// Remove a peer by full id. Returns `true` if a peer was removed.
+pub fn remove(id: &str) -> anyhow::Result<bool> {
+    let mut list = load()?;
+    let before = list.peers.len();
+    list.peers.retain(|p| p.id != id);
+    let removed = list.peers.len() < before;
+    if removed {
+        save(&list)?;
+    }
+    Ok(removed)
+}

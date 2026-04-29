@@ -625,7 +625,7 @@ async fn handle_key(
         }
     }
 
-    // Peers-tab actions: P to pair, J to join.
+    // Peers-tab actions: P to pair, J to join, X to forget DOWN peers.
     let in_peers = state.lock().await.tab == Some(Tab::Peers);
     if in_peers {
         if let KeyCode::Char('p') | KeyCode::Char('P') = key.code {
@@ -639,6 +639,10 @@ async fn handle_key(
                 error: None,
                 in_flight: false,
             };
+            return false;
+        }
+        if let KeyCode::Char('x') | KeyCode::Char('X') = key.code {
+            forget_down_peers(state.clone()).await;
             return false;
         }
     }
@@ -738,6 +742,57 @@ async fn handle_slash_command(state: Arc<Mutex<SharedState>>) -> bool {
 }
 
 // ---------------------------------------------------------- pair / join
+
+/// Remove every peer that has been pinged at least once and is currently DOWN
+/// (no successful RTT in `peer_health`). Persists the new list to
+/// `~/.mtw/peers.json` and updates the dashboard's in-memory state. Peers that
+/// have not been pinged yet are kept — they might just be slow to come up.
+async fn forget_down_peers(state: Arc<Mutex<SharedState>>) {
+    let stale_ids: Vec<String> = {
+        let s = state.lock().await;
+        s.peers
+            .iter()
+            .filter(|p| {
+                matches!(
+                    s.peer_health.get(&p.id),
+                    Some(h) if h.last_rtt_ms.is_none()
+                )
+            })
+            .map(|p| p.id.clone())
+            .collect()
+    };
+    if stale_ids.is_empty() {
+        let mut s = state.lock().await;
+        s.push_activity(
+            ActivityKind::Info,
+            "no DOWN peers to forget — every peer is either UP or hasn't been pinged yet",
+        );
+        return;
+    }
+    let mut removed = 0usize;
+    for id in &stale_ids {
+        match mtw_core::peers::remove(id) {
+            Ok(true) => removed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                let mut s = state.lock().await;
+                s.push_activity(
+                    ActivityKind::Err,
+                    format!("forget peer {}: {e}", short_id(id)),
+                );
+            }
+        }
+    }
+    let mut s = state.lock().await;
+    s.peers.retain(|p| !stale_ids.contains(&p.id));
+    for id in &stale_ids {
+        s.peer_health.remove(id);
+    }
+    s.push_activity(
+        ActivityKind::Ok,
+        format!("forgot {removed} DOWN peer{}", if removed == 1 { "" } else { "s" }),
+    );
+}
 
 async fn start_pair(state: Arc<Mutex<SharedState>>) {
     {
@@ -2447,7 +2502,30 @@ fn render_tab_peers(f: &mut ratatui::Frame, area: Rect, s: &SharedState) {
                 Span::raw(note),
             ]));
         }
+        let any_up = s
+            .peers
+            .iter()
+            .any(|p| matches!(s.peer_health.get(&p.id), Some(h) if h.last_rtt_ms.is_some()));
+        if !any_up {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  every peer is DOWN — they're saved but unreachable. Re-pair, or remove with X.",
+                Style::default().fg(MUTED),
+            )));
+        }
     }
+
+    // Persistent keybinding footer — visible whether peers are listed or not.
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("[P]", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("  pair this device   ", Style::default().fg(MUTED)),
+        Span::styled("[J]", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("  join with an invite   ", Style::default().fg(MUTED)),
+        Span::styled("[X]", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+        Span::styled("  forget every peer that is DOWN", Style::default().fg(MUTED)),
+    ]));
 
     f.render_widget(
         Paragraph::new(lines).wrap(Wrap { trim: false }),
@@ -2658,6 +2736,7 @@ fn render_tab_help(f: &mut ratatui::Frame, area: Rect) {
         ("Ctrl-O (Chat)", "toggle Chat / Code mode (alt)"),
         ("P (Peers)", "pair this device — shows invite string"),
         ("J (Peers)", "join another device — paste an invite"),
+        ("X (Peers)", "forget every peer that is currently DOWN"),
         ("Ctrl-R", "force an immediate peer-ping round"),
         ("?  or  F1", "toggle this help overlay"),
         ("Esc or Ctrl-C or q", "quit"),
