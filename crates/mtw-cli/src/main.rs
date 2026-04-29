@@ -247,12 +247,37 @@ async fn main() -> anyhow::Result<()> {
             url,
             tick_ms,
             ping_every_s,
-        } => dashboard::run(dashboard::DashboardArgs {
-            url,
-            tick: std::time::Duration::from_millis(tick_ms),
-            ping_every: std::time::Duration::from_secs(ping_every_s),
-        })
-        .await,
+        } => {
+            // Auto-start the engine if it isn't already responding, and run
+            // a supervisor that respawns it whenever the dashboard signals
+            // (e.g. user picked a different model in the Models tab).
+            let restart = Arc::new(tokio::sync::Notify::new());
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+
+            let supervisor = if engine_is_up().await {
+                None
+            } else {
+                eprintln!("[mtw dashboard] no engine running — auto-spawning one…");
+                Some(tokio::spawn(supervise_engine(
+                    restart.clone(),
+                    shutdown.clone(),
+                )))
+            };
+
+            let result = dashboard::run(dashboard::DashboardArgs {
+                url,
+                tick: std::time::Duration::from_millis(tick_ms),
+                ping_every: std::time::Duration::from_secs(ping_every_s),
+                engine_restart: Some(restart.clone()),
+            })
+            .await;
+
+            shutdown.notify_one();
+            if let Some(h) = supervisor {
+                let _ = h.await;
+            }
+            result
+        }
         Command::Chat {
             prompt,
             url,
@@ -478,6 +503,104 @@ struct StartArgs {
     mem_limit: u32,
 }
 
+/// Probe `localhost:9337/healthz` with a tight timeout — used to decide
+/// whether the user already has a `mtw serve` running.
+async fn engine_is_up() -> bool {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(500))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    client
+        .get(format!("http://127.0.0.1:{}/healthz", DEFAULT_PROXY_PORT))
+        .send()
+        .await
+        .map(|r| r.status().is_success())
+        .unwrap_or(false)
+}
+
+/// Build a default `ServeArgs` from current persistent settings (active
+/// model, default SwiftLM binary). Returns `None` if either prereq is
+/// missing — caller should let the dashboard banner say so instead of
+/// trying to spawn an engine that will fail.
+fn default_serve_args_or_none() -> Option<ServeArgs> {
+    let swiftlm = default_swiftlm_binary();
+    let model = default_model_dir();
+    if !swiftlm.is_file() {
+        return None;
+    }
+    if !model.is_dir() || !model.join("config.json").is_file() {
+        return None;
+    }
+    Some(ServeArgs {
+        model,
+        swiftlm,
+        swiftlm_port: DEFAULT_SWIFTLM_PORT,
+        proxy_port: DEFAULT_PROXY_PORT,
+        mem_limit: 4096,
+        mock: false,
+        attach: None,
+        draft_model: None,
+        num_draft_tokens: 4,
+    })
+}
+
+/// Long-running supervisor that owns a single engine task and re-spawns it
+/// whenever a notification arrives. The notification path is what makes
+/// "Enter on a new model in the dashboard" produce a live engine swap.
+async fn supervise_engine(
+    restart: Arc<tokio::sync::Notify>,
+    shutdown: Arc<tokio::sync::Notify>,
+) {
+    loop {
+        let args = match default_serve_args_or_none() {
+            Some(a) => a,
+            None => {
+                // Wait for either a restart hint (user fixed the prereq +
+                // signalled) or shutdown.
+                tokio::select! {
+                    _ = restart.notified() => continue,
+                    _ = shutdown.notified() => return,
+                }
+            }
+        };
+        eprintln!(
+            "[mtw] starting engine: model={}",
+            args.model.display()
+        );
+        let mut task = tokio::spawn(serve_cmd(args));
+        tokio::select! {
+            // The engine task exited on its own (crash or normal stop).
+            res = &mut task => {
+                if let Ok(Err(e)) = res {
+                    eprintln!("[mtw] engine exited with error: {e:#}");
+                }
+                // Wait for a restart hint or shutdown before respawning so
+                // we don't tight-loop.
+                tokio::select! {
+                    _ = restart.notified() => continue,
+                    _ = shutdown.notified() => return,
+                }
+            }
+            _ = restart.notified() => {
+                eprintln!("[mtw] active model changed — restarting engine");
+                task.abort();
+                let _ = task.await;
+                // tiny pause so the SwiftLM child fully releases the port
+                tokio::time::sleep(std::time::Duration::from_millis(750)).await;
+                continue;
+            }
+            _ = shutdown.notified() => {
+                task.abort();
+                let _ = task.await;
+                return;
+            }
+        }
+    }
+}
+
 /// `mtw start` — one-command flow: spawn `mtw serve` in the background, wait
 /// for it to be ready, then open the dashboard. Ctrl-C in the dashboard
 /// brings both down.
@@ -549,15 +672,27 @@ async fn start_cmd(args: StartArgs) -> anyhow::Result<()> {
     println!("✓ engine ready — opening dashboard (Ctrl-C to stop)");
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
 
+    // Hand the dashboard a Notify it can poke when the user picks a new
+    // model. We tear down the boot serve_handle and switch to the
+    // supervisor so the live-swap path is active.
+    serve_handle.abort();
+    let _ = serve_handle.await;
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let restart = Arc::new(tokio::sync::Notify::new());
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let supervisor = tokio::spawn(supervise_engine(restart.clone(), shutdown.clone()));
+
     let dashboard_args = dashboard::DashboardArgs {
         url: format!("http://127.0.0.1:{}", DEFAULT_PROXY_PORT),
         tick: std::time::Duration::from_millis(500),
         ping_every: std::time::Duration::from_secs(10),
+        engine_restart: Some(restart),
     };
     let dashboard_result = dashboard::run(dashboard_args).await;
 
-    serve_handle.abort();
-    let _ = serve_handle.await;
+    shutdown.notify_one();
+    let _ = supervisor.await;
     dashboard_result
 }
 

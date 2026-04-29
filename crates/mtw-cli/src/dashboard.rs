@@ -75,6 +75,11 @@ pub struct DashboardArgs {
     pub url: String,
     pub tick: Duration,
     pub ping_every: Duration,
+    /// When set, the dashboard signals this Notify whenever it changes the
+    /// active model. The supervisor that spawned the engine listens and
+    /// restarts SwiftLM with the new model — the user gets a live swap
+    /// instead of having to ctrl-C and rerun.
+    pub engine_restart: Option<Arc<tokio::sync::Notify>>,
 }
 
 // ---------------------------------------------------------- state
@@ -219,6 +224,10 @@ struct SharedState {
     /// `mtw start` will load. May differ from `node.model.name` (which is
     /// the model the *running* engine has loaded).
     active_model_dir: Option<std::path::PathBuf>,
+    /// Set by the parent `mtw dashboard` runner when it owns the engine
+    /// supervisor. The model picker pings it on a successful set so the
+    /// supervisor restarts SwiftLM with the new model.
+    engine_restart: Option<Arc<tokio::sync::Notify>>,
 
     chat: Vec<ChatTurn>,
     input: String,
@@ -267,6 +276,7 @@ impl SharedState {
             models_cursor: self.models_cursor,
             models_filter: self.models_filter,
             active_model_dir: self.active_model_dir.clone(),
+            engine_restart: self.engine_restart.clone(),
             chat: self.chat.clone(),
             input: self.input.clone(),
             streaming: self.streaming,
@@ -297,7 +307,11 @@ impl SharedState {
 // ---------------------------------------------------------- entry
 
 pub async fn run(args: DashboardArgs) -> anyhow::Result<()> {
-    let state = Arc::new(Mutex::new(SharedState::new()));
+    let state = Arc::new(Mutex::new({
+        let mut s = SharedState::new();
+        s.engine_restart = args.engine_restart.clone();
+        s
+    }));
 
     let secret = mtw_core::identity::load_or_create()?;
     let endpoint = Endpoint::builder(presets::N0)
@@ -941,14 +955,25 @@ async fn set_active_model_action(
 ) {
     match mtw_core::active_model::set(&path) {
         Ok(()) => {
-            let mut s = state.lock().await;
-            s.push_activity(
-                ActivityKind::Ok,
-                format!(
-                    "active model: {} — restart `mtw start` to load it",
-                    dir_name
-                ),
-            );
+            let restart = {
+                let mut s = state.lock().await;
+                let restart = s.engine_restart.clone();
+                let msg = if restart.is_some() {
+                    format!("active model: {} — restarting engine…", dir_name)
+                } else {
+                    format!(
+                        "active model: {} — restart `mtw start` to load it",
+                        dir_name
+                    )
+                };
+                s.push_activity(ActivityKind::Ok, msg);
+                restart
+            };
+            // Ping the supervisor outside the state lock — it will abort the
+            // current engine task and respawn SwiftLM with the new model.
+            if let Some(n) = restart {
+                n.notify_one();
+            }
         }
         Err(e) => {
             let mut s = state.lock().await;
