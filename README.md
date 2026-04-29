@@ -17,26 +17,104 @@ No cloud. No accounts. Your prompts and your data stay on your machines.
 
 ---
 
+## Demo
+
+<!--
+  To embed a screen recording: drag a .mp4 / .mov / .gif into a comment on
+  any GitHub issue or PR in this repo, then copy the resulting `https://github.com/...
+  /assets/...` URL and paste it where the placeholder below points to.
+
+  Replace the line below with:
+      https://github.com/mrunalpendem123/meshthatworks/assets/<id>/<filename>
+
+  GitHub renders that URL inline as an HTML5 video player.
+-->
+
+> 📹 Demo video coming soon. In the meantime, here is what the install + first run looks like:
+
+```text
+$ curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
+==> Checking base tools
+==> Cloning / updating ~/.meshthatworks
+==> Building mtw (first time ~5 min)
+   Compiling mtw-core v0.1.0
+   Compiling mtw-engine v0.1.0
+   ...
+   Finished `release` profile [optimized] target(s) in 4m 33s
+==> Installed: ~/.local/bin/mtw
+==> Cloning + building SwiftLM (~30 min, ~3 GB disk)
+==> All set. Running mtw doctor:
+
+mtw doctor — environment check
+
+local setup
+  mtw on PATH     ✓
+  Xcode + Metal   ✓
+  SwiftLM binary  ✓  ~/.meshthatworks-deps/SwiftLM/.build/arm64-apple-macosx/release/SwiftLM
+  Model           ✗  no model installed yet — open `mtw dashboard` and pick one from the Models tab
+
+running network probes (~5–10s)…
+
+  IPv6            ✓ reachable  (local: 2401:4900:88f4:d88f:1da:da0f:164c:2dc1)
+  IPv4 (public)   ✓ 122.177.245.210
+  NAT type        ✓ endpoint-independent (122.177.245.210:13425)  hole-punching works
+  macOS firewall  ? unknown
+
+  Verdict         ✓ IPv6 available — direct connection essentially always works
+
+──────────────────────────────────────────────────────────
+Next: pick a model.
+       mtw dashboard          # opens the Models tab — choose one and download
+```
+
+```text
+$ mtw start
+mtw start: launching engine + dashboard…
+  model:  ~/.meshthatworks-deps/models/OLMoE-1B-7B-0125-Instruct-4bit
+  engine: ~/.meshthatworks-deps/SwiftLM/.build/arm64-apple-macosx/release/SwiftLM
+
+waiting for engine to come up (model load can take ~30s cold)…
+✓ engine ready — opening dashboard (Ctrl-C to stop)
+
+┌ mtw dashboard ──────────────────────────────────────────────────────────────┐
+│ 1 Dashboard   2 Chat   3 Peers   4 Models   5 Help                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ Identity       7b3a9c1e…1f02                                                 │
+│ Model          OLMoE-1B-7B-0125-Instruct-4bit  (16 layers, 64 experts)       │
+│ Proxy          ● up        http://localhost:9337                             │
+│ Peers          0 paired                                                      │
+│                                                                              │
+│ Activity                                                                     │
+│   12:04:33  ok    proxy ready on :9337                                       │
+│   12:04:35  ok    SwiftLM healthz responded                                  │
+│                                                                              │
+│ mesh: 0 peers   proxy: ● up   net: ● direct (IPv6)   state: ● idle           │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
 ## Table of contents
 
-1. [The problem](#the-problem)
-2. [How it works](#how-it-works)
-3. [Install](#install)
-4. [Pick a model](#pick-a-model)
-5. [Run it](#run-it)
-6. [Use it from Claude Code, Cursor, anything](#use-it-from-claude-code-cursor-anything)
-7. [Pair a second device](#pair-a-second-device)
-8. [Architecture in depth](#architecture-in-depth)
-9. [Configuration reference](#configuration-reference)
-10. [Performance and tracing](#performance-and-tracing)
-11. [Troubleshooting](#troubleshooting)
-12. [Status — what works today](#status--what-works-today)
-13. [Roadmap](#roadmap)
-14. [Build from source](#build-from-source)
-15. [Common commands](#common-commands)
-16. [Contribute](#contribute)
-17. [Acknowledgements](#acknowledgements)
-18. [License](#license)
+1. [Demo](#demo)
+2. [The problem](#the-problem)
+3. [How it works](#how-it-works)
+4. [Install](#install)
+5. [Pick a model](#pick-a-model)
+6. [Run it](#run-it)
+7. [Use it from Claude Code, Cursor, anything](#use-it-from-claude-code-cursor-anything)
+8. [Pair a second device](#pair-a-second-device)
+9. [Architecture in depth](#architecture-in-depth)
+10. [Configuration reference](#configuration-reference)
+11. [Performance and tracing](#performance-and-tracing)
+12. [Troubleshooting](#troubleshooting)
+13. [Status — what works today](#status--what-works-today)
+14. [Roadmap](#roadmap)
+15. [Build from source](#build-from-source)
+16. [Common commands](#common-commands)
+17. [Contribute](#contribute)
+18. [Acknowledgements](#acknowledgements)
+19. [License](#license)
 
 ---
 
@@ -114,6 +192,52 @@ Each device only has to hold half the model's weights, half the page-cache press
 Each device runs SwiftLM with `MTW_LAYER_RANGE=K,M` so it only loads its slice. The slices share weights only by coincidence — most of an MoE's parameters live inside experts, and routing is independent per layer. So splitting layers across devices does not waste capacity.
 
 The orchestrator (the device the user typed at) drives the pipeline: tokenize, send tokens to the first peer, receive activation, forward to the next peer, receive logits, sample next token, loop.
+
+### One inference step, traced
+
+What happens when you ask the mesh to generate a single token, with two paired devices:
+
+```
+  user (device A)                        device A engine                     device B engine
+        │                                       │                                   │
+        │  POST /v1/chat/completions            │                                   │
+        ├──────────────────────────────────────▶│                                   │
+        │                                       │                                   │
+        │                                       │  tokenize prompt                  │
+        │                                       │  build ChatML template            │
+        │                                       │                                   │
+        │                                       │  POST /v1/layer-forward           │
+        │                                       │  { tokens, MTW_LAYER_RANGE=0..K } │
+        │                                       │     │                             │
+        │                                       │     ▼                             │
+        │                                       │  embed + run layers 0..K          │
+        │                                       │  (router selects 8 experts/layer; │
+        │                                       │   MLX pulls them from page cache, │
+        │                                       │   page cache pulls from SSD if    │
+        │                                       │   they were not resident)         │
+        │                                       │                                   │
+        │                                       │  activation [batch, seq, hidden]  │
+        │                                       │  ────── bincode over iroh ──────▶ │
+        │                                       │       (mtw/layer-forward/0)       │
+        │                                       │                                   │  run layers K..N
+        │                                       │                                   │  norm + lm_head
+        │                                       │                                   │  → logits
+        │                                       │ ◀────── bincode over iroh ──────  │
+        │                                       │                                   │
+        │                                       │  argmax (greedy) or sample        │
+        │                                       │  → next token                     │
+        │                                       │                                   │
+        │  SSE: chunk { delta: " hi" }          │                                   │
+        │ ◀─────────────────────────────────────┤                                   │
+        │                                       │  loop until EOS or max_tokens     │
+```
+
+A few things worth noting:
+
+- The activation payload is small (~2 MB for `hidden=4096`, `seq=128`). A direct QUIC link between two Macs in the same room (Wi-Fi, Thunderbolt, or even cellular hotspot) handles it without bottlenecking.
+- The orchestrator is whichever device the user is talking to. The other device is "just" a layer-forward target; it does not need a special role.
+- bincode is used because JSON would 6× the payload size on f32 tensors. Same `serde` derives as JSON, no extra type-level cost.
+- If a peer is unreachable, the orchestrator falls back to running the whole pass locally (slower, but the request still completes).
 
 ---
 
