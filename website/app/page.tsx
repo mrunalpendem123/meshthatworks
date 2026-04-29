@@ -42,7 +42,7 @@ export default function Page() {
             </div>
             <div className="px-4 py-3 text-fg select-all">
               <span className="text-fgDim">$ </span>
-              curl -fsSL meshthatworks.vercel.app/install | sh
+              curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
             </div>
           </div>
 
@@ -314,7 +314,7 @@ export default function Page() {
             <CommandLine
               num="1"
               comment="install — clones, builds, sets up ~/.local/bin/mtw"
-              cmd="curl -fsSL meshthatworks.vercel.app/install | sh"
+              cmd="curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh"
             />
             <CommandLine
               num="2"
@@ -379,7 +379,7 @@ function CommandLine({
       <div className="text-muted text-xs mb-1">
         # {num}. {comment}
       </div>
-      <div className="bg-bgElev border border-line rounded-md px-4 py-2 text-fg select-all">
+      <div className="bg-bgElev border border-line rounded-md px-4 py-2 text-fg select-all break-all">
         <span className="text-fgDim">$ </span>
         {cmd}
       </div>
