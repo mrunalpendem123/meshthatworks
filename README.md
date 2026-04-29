@@ -1,5 +1,7 @@
 # MeshThatWorks
 
+[**meshthatworks.vercel.app**](https://meshthatworks.vercel.app) · [docs](https://github.com/mrunalpendem123/meshthatworks#table-of-contents) · [architecture](docs/ARCHITECTURE.md) · [benchmarks](docs/BASELINES.md)
+
 **Frontier AI on the Macs you already own.**
 
 The biggest open AI models — DeepSeek, Qwen3-Coder, Llama, Mixtral — are free to download. Most people still cannot run them, because the math wants 16+ GB of RAM per device and most consumer Macs have 8.
