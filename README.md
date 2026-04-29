@@ -17,6 +17,32 @@ No cloud. No accounts. Your prompts and your data stay on your machines.
 
 ---
 
+## Quickstart
+
+Three commands. The first one takes ~30 minutes the first time (it builds SwiftLM); the others are seconds.
+
+```bash
+# 1. Install — clones, builds, sets up ~/.local/bin/mtw
+curl -sSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh
+
+# 2. Pick a model — opens the dashboard's Models tab, choose one, hit Enter
+mtw dashboard
+
+# 3. Run — engine + dashboard in one terminal, Ctrl-C to stop
+mtw start
+```
+
+Then point any OpenAI-compatible app at `http://localhost:9337`:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:9337/v1
+export OPENAI_API_KEY=local
+```
+
+That's it. The rest of this README is for when you want to know *how* and *why*.
+
+---
+
 ## Demo
 
 <!--
@@ -96,25 +122,26 @@ waiting for engine to come up (model load can take ~30s cold)…
 
 ## Table of contents
 
-1. [Demo](#demo)
-2. [The problem](#the-problem)
-3. [How it works](#how-it-works)
-4. [Install](#install)
-5. [Pick a model](#pick-a-model)
-6. [Run it](#run-it)
-7. [Use it from Claude Code, Cursor, anything](#use-it-from-claude-code-cursor-anything)
-8. [Pair a second device](#pair-a-second-device)
-9. [Architecture in depth](#architecture-in-depth)
-10. [Configuration reference](#configuration-reference)
-11. [Performance and tracing](#performance-and-tracing)
-12. [Troubleshooting](#troubleshooting)
-13. [Status — what works today](#status--what-works-today)
-14. [Roadmap](#roadmap)
-15. [Build from source](#build-from-source)
-16. [Common commands](#common-commands)
-17. [Contribute](#contribute)
-18. [Acknowledgements](#acknowledgements)
-19. [License](#license)
+1. [Quickstart](#quickstart)
+2. [Demo](#demo)
+3. [The problem](#the-problem)
+4. [How it works](#how-it-works)
+5. [Install](#install)
+6. [Pick a model](#pick-a-model)
+7. [Run it](#run-it)
+8. [Use it from Claude Code, Cursor, anything](#use-it-from-claude-code-cursor-anything)
+9. [Pair a second device](#pair-a-second-device)
+10. [Architecture in depth](#architecture-in-depth)
+11. [Configuration reference](#configuration-reference)
+12. [Performance and tracing](#performance-and-tracing)
+13. [Troubleshooting](#troubleshooting)
+14. [Status — what works today](#status--what-works-today)
+15. [Roadmap](#roadmap)
+16. [Build from source](#build-from-source)
+17. [Common commands](#common-commands)
+18. [Contribute](#contribute)
+19. [Acknowledgements](#acknowledgements)
+20. [License](#license)
 
 ---
 
