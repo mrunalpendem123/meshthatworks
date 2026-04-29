@@ -147,4 +147,4 @@ Issues, PRs, and benchmarks on hardware we haven't tested are all welcome. The i
 
 ## License
 
-Apache-2.0. See [`LICENSE`](LICENSE).
+MIT. See [`LICENSE`](LICENSE).
