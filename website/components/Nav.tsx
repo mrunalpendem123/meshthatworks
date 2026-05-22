@@ -1,7 +1,7 @@
 import { Wordmark } from './Brand';
 
 const REPO = 'https://github.com/mrunalpendem123/meshthatworks';
-const RELEASES = `${REPO}/releases/latest`;
+const DMG = `${REPO}/releases/latest/download/MeshThatWorks_0.1.0_aarch64.dmg`;
 
 export function Nav() {
   return (
@@ -20,7 +20,7 @@ export function Nav() {
           <a href={REPO} className="hidden rounded-full px-3.5 py-1.5 text-ink-2 transition-colors hover:text-ink-0 sm:block">
             GitHub
           </a>
-          <a href={RELEASES} className="pill pill-primary ml-1 px-4 py-1.5 text-[13px] no-underline">
+          <a href={DMG} className="pill pill-primary ml-1 px-4 py-1.5 text-[13px] no-underline">
             Download
           </a>
         </div>

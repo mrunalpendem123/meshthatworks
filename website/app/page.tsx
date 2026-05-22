@@ -7,6 +7,8 @@ import { MeshMark } from '@/components/Brand';
 
 const REPO = 'https://github.com/mrunalpendem123/meshthatworks';
 const RELEASES = `${REPO}/releases/latest`;
+// Direct-download URL: GitHub 302s straight to the asset with a download header.
+const DMG = `${REPO}/releases/latest/download/MeshThatWorks_0.1.0_aarch64.dmg`;
 const INSTALL_CMD =
   'curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh';
 
@@ -39,7 +41,7 @@ export default function Page() {
           </p>
 
           <div className="animate-fade-up mt-9 flex flex-wrap items-center justify-center gap-3">
-            <a href={RELEASES} className="pill pill-primary px-6 py-3 text-[15px] no-underline">
+            <a href={DMG} className="pill pill-primary px-6 py-3 text-[15px] no-underline">
               ↓ Download for Mac
             </a>
             <a href={REPO} className="pill px-5 py-3 text-[14px] text-ink-0 no-underline">
@@ -176,7 +178,7 @@ export default function Page() {
                   Download, open, and let the onboarding set up the engine and a model. Globe,
                   chat, and mesh pairing built in.
                 </p>
-                <a href={RELEASES} className="pill pill-primary mt-4 px-5 py-2.5 text-[14px] no-underline">
+                <a href={DMG} className="pill pill-primary mt-4 px-5 py-2.5 text-[14px] no-underline">
                   ↓ Download for Mac
                 </a>
               </div>
