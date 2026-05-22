@@ -155,6 +155,26 @@ enum Command {
         #[arg(long, default_value_t = 600)]
         peer_timeout: u64,
     },
+    /// Run a SPLIT (layer-pipelined) chat across two SwiftLM peers — each
+    /// launched with MTW_LAYER_RANGE for its layer slice. Proves distributed
+    /// inference end-to-end through `mtw`.
+    SplitChat {
+        /// Prompt text.
+        #[arg(trailing_var_arg = true, required = true)]
+        prompt: Vec<String>,
+        /// First peer (owns embedding + first layer slice).
+        #[arg(long, default_value = "http://127.0.0.1:9971")]
+        peer_a: String,
+        /// Last peer (owns last layer slice + norm + lm_head).
+        #[arg(long, default_value = "http://127.0.0.1:9972")]
+        peer_b: String,
+        /// Model directory (for the tokenizer + config).
+        #[arg(long)]
+        model_dir: PathBuf,
+        /// Max tokens to generate.
+        #[arg(long, default_value_t = 60)]
+        max_tokens: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -294,6 +314,13 @@ async fn main() -> anyhow::Result<()> {
                 chat_cmd(joined, url, max_tokens, temperature, model_dir).await
             }
         }
+        Command::SplitChat {
+            prompt,
+            peer_a,
+            peer_b,
+            model_dir,
+            max_tokens,
+        } => split_chat_cmd(prompt.join(" "), peer_a, peer_b, model_dir, max_tokens).await,
     }
 }
 
@@ -831,6 +858,48 @@ async fn chat_cmd(
     eprintln!();
     eprintln!(
         "  [{} prompt + {} completion tokens in {}ms ≈ {:.2} tok/s]",
+        resp.prompt_tokens,
+        resp.completion_tokens,
+        resp.latency_ms,
+        resp.completion_tokens as f64 / (resp.latency_ms as f64 / 1000.0).max(0.01),
+    );
+    Ok(())
+}
+
+/// `mtw split-chat` — drive layer-split inference across two SwiftLM peers.
+/// Each peer must already be running, launched with its `MTW_LAYER_RANGE`.
+async fn split_chat_cmd(
+    prompt: String,
+    peer_a: String,
+    peer_b: String,
+    model_dir: PathBuf,
+    max_tokens: usize,
+) -> anyhow::Result<()> {
+    use mtw_engine::{LayerPeer, LayerSplitEngine};
+    use std::sync::Arc;
+
+    eprintln!("split-chat: assembling 2-peer pipeline");
+    eprintln!("  peer A (embed + first slice): {peer_a}");
+    eprintln!("  peer B (last slice + head):   {peer_b}");
+
+    let a = Arc::new(SwiftLMEngine::attach(&peer_a, Some(&model_dir)).await?) as Arc<dyn LayerPeer>;
+    let b = Arc::new(SwiftLMEngine::attach(&peer_b, Some(&model_dir)).await?) as Arc<dyn LayerPeer>;
+    let engine = LayerSplitEngine::new(vec![a, b], &model_dir)?;
+    eprintln!("  pipeline ready: {}", engine.model_info().name);
+    eprintln!();
+
+    let resp = engine
+        .chat_complete(ChatRequest {
+            messages: vec![ChatMessage::user(prompt)],
+            max_tokens: Some(max_tokens),
+            temperature: Some(0.0),
+        })
+        .await?;
+
+    println!("{}", resp.content);
+    eprintln!();
+    eprintln!(
+        "  [{} prompt + {} completion tokens across the split in {}ms ≈ {:.2} tok/s]",
         resp.prompt_tokens,
         resp.completion_tokens,
         resp.latency_ms,

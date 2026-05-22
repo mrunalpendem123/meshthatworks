@@ -1,0 +1,135 @@
+diff --git a/Sources/SwiftLM/Server.swift b/Sources/SwiftLM/Server.swift
+index d1298ac..1fe1997 100644
+--- a/Sources/SwiftLM/Server.swift
++++ b/Sources/SwiftLM/Server.swift
+@@ -910,6 +910,26 @@ struct MLXServer: AsyncParsableCommand {
+             }
+         }
+ 
++        // MeshThatWorks: partial layer forward for split (distributed) inference.
++        // Runs only this node's layer slice (MTW_LAYER_RANGE=start,end) and
++        // returns the activation (or logits if this node owns the last layer).
++        router.post("/v1/layer-forward") { request, _ -> Response in
++            do {
++                let bodyData = try await collectBody(request)
++                return try await handleLayerForward(bodyData: bodyData, container: container)
++            } catch {
++                let errMsg = String(describing: error).replacingOccurrences(of: "\"", with: "'")
++                let payload = """
++                {"error":{"message":"\(errMsg)","type":"server_error","code":"layer_forward_error"}}
++                """
++                return Response(
++                    status: .internalServerError,
++                    headers: jsonHeaders(),
++                    body: .init(byteBuffer: ByteBuffer(string: payload))
++                )
++            }
++        }
++
+         // Prometheus-compatible metrics endpoint
+         router.get("/metrics") { _, _ -> Response in
+             let activeMemBytes = Memory.activeMemory
+@@ -1285,6 +1305,103 @@ actor PromptCache {
+ 
+ // ── Request Body Extraction ──────────────────────────────────────────────────
+ 
++// MeshThatWorks: request/response for split (layer-forward) inference.
++struct MeshLayerForwardRequest: Decodable {
++    let input_kind: String        // "tokens" | "activation"
++    let shape: [Int]
++    let data: [Double]
++    let session_id: String?       // persistent KV-cache key for this generation
++    let reset: Bool?              // drop this session's cache (start of a new generation)
++}
++
++enum MeshLayerForwardError: Error, CustomStringConvertible {
++    case unsupportedModel
++    var description: String {
++        switch self {
++        case .unsupportedModel:
++            return "this model architecture does not support layer-split (MeshSplittable) yet"
++        }
++    }
++}
++
++// Per-session KV cache for THIS node's layers, persisted across prefill + every
++// decode step so multi-token generation works across the split.
++final class MeshCacheStore: @unchecked Sendable {
++    static let shared = MeshCacheStore()
++    private let lock = NSLock()
++    private var caches: [String: [KVCache]] = [:]
++    func get(_ id: String) -> [KVCache]? { lock.lock(); defer { lock.unlock() }; return caches[id] }
++    func put(_ id: String, _ c: [KVCache]) { lock.lock(); defer { lock.unlock() }; caches[id] = c }
++    func drop(_ id: String) { lock.lock(); defer { lock.unlock() }; caches[id] = nil }
++}
++
++/// Run this node's layer slice (MTW_LAYER_RANGE=start,end) over the incoming
++/// tokens/activation and return the resulting activation (or logits if this
++/// node owns the last layer).
++func handleLayerForward(bodyData: Data, container: ModelContainer) async throws -> Response {
++    let req = try JSONDecoder().decode(MeshLayerForwardRequest.self, from: bodyData)
++
++    var start = 0
++    var end = Int.max
++    if let raw = ProcessInfo.processInfo.environment["MTW_LAYER_RANGE"] {
++        let parts = raw.split(separator: ",")
++        if parts.count == 2,
++            let s = Int(parts[0].trimmingCharacters(in: .whitespaces)),
++            let e = Int(parts[1].trimmingCharacters(in: .whitespaces))
++        {
++            start = s
++            end = e
++        }
++    }
++
++    let fromTokens = req.input_kind == "tokens"
++    let input: MLXArray
++    if fromTokens {
++        input = MLXArray(req.data.map { Int32($0) }).reshaped(req.shape)
++    } else {
++        input = MLXArray(req.data.map { Float($0) }).reshaped(req.shape)
++    }
++
++    let sessionId = req.session_id
++    if let sid = sessionId, req.reset == true { MeshCacheStore.shared.drop(sid) }
++
++    let (outData, outShape): ([Float], [Int]) = try await container.perform { context in
++        guard let splittable = context.model as? MeshSplittable else {
++            throw MeshLayerForwardError.unsupportedModel
++        }
++        // With a session_id: reuse a persistent KV cache so each decode step
++        // appends (fast multi-token gen). Without one: a fresh cache per call —
++        // stateless, for callers that re-run the full sequence each step.
++        let cache: [KVCache]
++        if let sid = sessionId {
++            if let existing = MeshCacheStore.shared.get(sid) {
++                cache = existing
++            } else {
++                cache = context.model.newCache(parameters: GenerateParameters())
++                MeshCacheStore.shared.put(sid, cache)
++            }
++        } else {
++            cache = context.model.newCache(parameters: GenerateParameters())
++        }
++        let out = splittable.meshLayerForward(
++            input, fromTokens: fromTokens, start: start, end: end, cache: cache)
++        eval(out)
++        if sessionId != nil { for c in cache { eval(c) } }  // persist only sessions
++        return (out.asArray(Float.self), out.shape)
++    }
++
++    var json = "{\"shape\":["
++    json += outShape.map(String.init).joined(separator: ",")
++    json += "],\"data\":["
++    json += outData.map { String($0) }.joined(separator: ",")
++    json += "]}"
++    return Response(
++        status: .ok,
++        headers: jsonHeaders(),
++        body: .init(byteBuffer: ByteBuffer(string: json))
++    )
++}
++
+ func collectBody(_ request: Request) async throws -> Data {
+     var bodyBuffer = try await request.body.collect(upTo: 100 * 1024 * 1024)
+     let bodyBytes = bodyBuffer.readBytes(length: bodyBuffer.readableBytes) ?? []

@@ -1,0 +1,57 @@
+{
+  "$schema": "../node_modules/@tauri-apps/cli/config.schema.json",
+  "productName": "MeshThatWorks",
+  "version": "0.1.0",
+  "identifier": "com.meshthatworks.desktop",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build"
+  },
+  "app": {
+    "macOSPrivateApi": true,
+    "windows": [
+      {
+        "title": "MeshThatWorks",
+        "width": 1120,
+        "height": 760,
+        "minWidth": 940,
+        "minHeight": 660,
+        "resizable": true,
+        "fullscreen": false,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "theme": "Dark",
+        "transparent": true,
+        "backgroundColor": "#05060d"
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["app", "dmg"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "externalBin": ["binaries/mtw"],
+    "resources": {
+      "resources/swiftlm": "swiftlm"
+    },
+    "copyright": "© 2026 MeshThatWorks contributors. MIT licensed.",
+    "category": "DeveloperTool",
+    "shortDescription": "Frontier AI on the Macs you already own.",
+    "longDescription": "Run frontier open-source MoE models across the Apple Silicon devices you already own — SSD expert streaming inside an iroh mesh. No cloud, no accounts, all local.",
+    "macOS": {
+      "minimumSystemVersion": "12.0",
+      "entitlements": "entitlements.plist"
+    }
+  }
+}

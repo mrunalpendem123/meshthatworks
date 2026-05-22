@@ -1,0 +1,38 @@
+[package]
+name = "meshthatworks-desktop"
+version = "0.1.0"
+description = "MeshThatWorks — frontier AI on the Macs you already own"
+authors = ["MeshThatWorks contributors"]
+license = "MIT"
+repository = "https://github.com/mrunalpendem123/meshthatworks"
+edition = "2021"
+rust-version = "1.77.2"
+
+# Standalone workspace so the Cargo workspace at the repo root (edition 2024,
+# the mtw-* crates) does not try to absorb this Tauri crate.
+[workspace]
+
+[lib]
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["macos-private-api"] }
+tauri-plugin-shell = "2"
+tauri-plugin-log = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log = "0.4"
+anyhow = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
+dirs = "5"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
