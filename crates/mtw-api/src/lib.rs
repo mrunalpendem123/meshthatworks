@@ -32,6 +32,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeStatus {
     pub endpoint_id: String,
+    /// Human-friendly node name (for the discovery list). Defaults to the host
+    /// name; falls back to a short id when unset.
+    #[serde(default)]
+    pub name: String,
     pub proxy_url: String,
     pub upstream_url: String,
     pub alpns: Vec<String>,
@@ -41,8 +45,14 @@ pub struct NodeStatus {
 }
 
 /// Configuration for the HTTP proxy.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ProxyConfig {
+    /// When set, `/v1/chat/completions` is answered by this engine (e.g. a
+    /// `LayerSplitEngine` driving inference across paired devices over iroh)
+    /// instead of being forwarded to a single upstream SwiftLM.
+    pub chat_engine: Option<Arc<dyn mtw_engine::InferenceEngine>>,
+    /// Live swarm-discovery registry, served at `GET /discovered`.
+    pub discovered: Option<mtw_core::gossip::Discovered>,
     /// Address our proxy listens on (typically `127.0.0.1:9337`).
     pub bind: std::net::SocketAddr,
     /// Base URL of the upstream SwiftLM we forward to (typically `http://127.0.0.1:9876`).
@@ -70,6 +80,8 @@ struct AppState {
     request_counter: Option<Arc<AtomicU64>>,
     trace_log_path: Option<Arc<str>>,
     started: Instant,
+    chat_engine: Option<Arc<dyn mtw_engine::InferenceEngine>>,
+    discovered: Option<mtw_core::gossip::Discovered>,
 }
 
 pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
@@ -83,11 +95,14 @@ pub async fn run(cfg: ProxyConfig) -> anyhow::Result<()> {
         request_counter: cfg.request_counter,
         trace_log_path: cfg.trace_log_path.map(Arc::from),
         started: Instant::now(),
+        chat_engine: cfg.chat_engine,
+        discovered: cfg.discovered,
     };
 
     let app = Router::new()
         .route("/healthz", get(healthz))
         .route("/status", get(status_handler))
+        .route("/discovered", get(discovered_handler))
         .route("/v1/models", any(proxy_root))
         .route("/v1/{*path}", any(proxy_passthrough))
         .with_state(state);
@@ -115,6 +130,16 @@ async fn status_handler(State(state): State<AppState>) -> Json<Arc<NodeStatus>> 
     Json(state.status.clone())
 }
 
+/// Live list of swarm nodes seen on the gossip room (for the discovery UI).
+async fn discovered_handler(
+    State(state): State<AppState>,
+) -> Json<Vec<mtw_core::gossip::DiscoveredNode>> {
+    match &state.discovered {
+        Some(d) => Json(d.list().await),
+        None => Json(Vec::new()),
+    }
+}
+
 async fn proxy_root(
     State(state): State<AppState>,
     method: Method,
@@ -136,6 +161,64 @@ async fn proxy_passthrough(
     proxy(state, method, uri, headers, body).await
 }
 
+/// Answer `/v1/chat/completions` from a local engine, formatted as a minimal
+/// SSE stream (one delta + `[DONE]`) so the existing client stream parser works.
+/// Used in split mode where the engine pipelines a forward pass across peers.
+async fn serve_chat_via_engine(
+    engine: Arc<dyn mtw_engine::InferenceEngine>,
+    body: &Bytes,
+) -> axum::response::Response {
+    #[derive(serde::Deserialize)]
+    struct InMsg {
+        role: String,
+        content: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct InReq {
+        messages: Vec<InMsg>,
+        #[serde(default)]
+        max_tokens: Option<usize>,
+        #[serde(default)]
+        temperature: Option<f32>,
+    }
+    let req: InReq = match serde_json::from_slice(body) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("bad chat request: {e}")).into_response(),
+    };
+    let chat_req = mtw_engine::ChatRequest {
+        messages: req
+            .messages
+            .into_iter()
+            .map(|m| mtw_engine::ChatMessage { role: m.role, content: m.content })
+            .collect(),
+        max_tokens: req.max_tokens,
+        temperature: req.temperature,
+    };
+    let content = match engine.chat_complete(chat_req).await {
+        Ok(resp) => resp.content,
+        Err(e) => {
+            let msg = format!("{e:#}").to_lowercase();
+            if msg.contains("dns")
+                || msg.contains("resolve")
+                || msg.contains("no addressing")
+                || msg.contains("timed out")
+                || msg.contains("connect")
+                || msg.contains("offline")
+            {
+                "⚠️ Split peer is offline or unreachable. The other Mac must be online, on the \
+                 same model, and set to “Be worker” — then try again. (Or switch this node to \
+                 Single mode to chat on its own.)"
+                    .to_string()
+            } else {
+                format!("⚠️ Split error: {e:#}")
+            }
+        }
+    };
+    let chunk = serde_json::json!({ "choices": [{ "index": 0, "delta": { "content": content } }] });
+    let sse = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+    ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse).into_response()
+}
+
 async fn proxy(
     state: AppState,
     method: Method,
@@ -143,6 +226,14 @@ async fn proxy(
     headers: HeaderMap,
     body: Bytes,
 ) -> axum::response::Response {
+    // Split mode: answer chat from the local engine (a LayerSplitEngine driving
+    // inference across paired devices over iroh) instead of forwarding to one
+    // upstream SwiftLM.
+    if uri.path() == "/v1/chat/completions" {
+        if let Some(engine) = state.chat_engine.clone() {
+            return serve_chat_via_engine(engine, &body).await;
+        }
+    }
     let path_and_query = uri.path_and_query().map(|p| p.as_str()).unwrap_or(uri.path());
     let target_url = format!("{}{}", state.upstream, path_and_query);
 

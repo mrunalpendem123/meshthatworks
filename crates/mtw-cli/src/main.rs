@@ -85,6 +85,15 @@ enum Command {
         /// Number of draft tokens per speculation round (only when --draft-model is set).
         #[arg(long, default_value_t = 4)]
         num_draft_tokens: u32,
+        /// Worker side of a split: serve ONLY layers `start,end` (e.g. `24,48`)
+        /// over iroh, for a paired head to pipeline into.
+        #[arg(long)]
+        layer_range: Option<String>,
+        /// Head side of a split: run layers `0..N/2` locally and pipeline the
+        /// rest to this paired peer (its endpoint id) over iroh. Chat then
+        /// splits across both devices.
+        #[arg(long)]
+        split_peer: Option<String>,
     },
     /// Show local info and ping every paired peer.
     Status,
@@ -218,6 +227,8 @@ async fn main() -> anyhow::Result<()> {
             attach,
             draft_model,
             num_draft_tokens,
+            layer_range,
+            split_peer,
         } => {
             serve_cmd(ServeArgs {
                 model: model.unwrap_or_else(default_model_dir),
@@ -229,6 +240,8 @@ async fn main() -> anyhow::Result<()> {
                 attach,
                 draft_model,
                 num_draft_tokens,
+                layer_range,
+                split_peer,
             })
             .await
         }
@@ -334,6 +347,10 @@ struct ServeArgs {
     attach: Option<String>,
     draft_model: Option<PathBuf>,
     num_draft_tokens: u32,
+    /// Worker: serve only layers "start,end". Head leaves this None.
+    layer_range: Option<String>,
+    /// Head: endpoint id of the paired worker to pipeline the upper layers to.
+    split_peer: Option<String>,
 }
 
 async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
@@ -345,6 +362,21 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let secret = mtw_core::identity::load_or_create()?;
+
+    // ── Split config ─────────────────────────────────────────────────────────
+    // Worker: serve only layers "start,end". Head (--split-peer): run layers
+    // 0..N/2 locally and pipeline N/2..N to the worker over iroh.
+    let worker_range = args.layer_range.as_deref().and_then(parse_layer_range);
+    let head_local_range: Option<(usize, usize)> = if args.split_peer.is_some() {
+        let n = read_num_layers(&args.model).context("read num_hidden_layers for split head")?;
+        Some((0, n / 2))
+    } else {
+        None
+    };
+    let slice = worker_range.or(head_local_range);
+    if let Some((lo, hi)) = slice {
+        println!("mtw serve: layer slice = {lo}..{hi}");
+    }
 
     // Build the engine according to the flags. Pull the SwiftLM request
     // counter and a LayerPeer handle out alongside the engine — the HTTP
@@ -382,6 +414,7 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         opts.mem_limit_mb = Some(args.mem_limit);
         opts.stream_experts = true;
         opts.ssd_prefetch = true;
+        opts.layer_range = slice; // worker slice, or head's local 0..N/2
         if let Some(d) = args.draft_model.clone() {
             opts.draft_model_dir = Some(d);
             opts.extra_args.push("--num-draft-tokens".into());
@@ -397,6 +430,25 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
             Some(counter),
             Some(arc as Arc<dyn mtw_engine::LayerPeer>),
         )
+    };
+
+    // Head of a split: build a LayerSplitEngine over [local 0..K, iroh worker
+    // K..N]. The proxy serves chat from it instead of forwarding to one SwiftLM.
+    let chat_engine: Option<Arc<dyn InferenceEngine>> = if let Some(peer) = args.split_peer.clone() {
+        let local_peer = layer_peer
+            .clone()
+            .context("split head requires a local SwiftLM layer peer")?;
+        let remote = mtw_core::layer_forward::dial_layer_peer(&peer).await?;
+        let se = mtw_engine::LayerSplitEngine::new(vec![local_peer, remote], &args.model)
+            .context("build split engine")?;
+        println!(
+            "mtw serve: SPLIT HEAD — local 0..{} + worker {}",
+            head_local_range.map(|r| r.1).unwrap_or(0),
+            peer
+        );
+        Some(Arc::new(se) as Arc<dyn InferenceEngine>)
+    } else {
+        None
     };
 
     // Proxy forwards to whatever engine's URL is. For MockEngine there is
@@ -417,6 +469,7 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     let endpoint_id_str = secret.public().to_string();
     let node_status = NodeStatus {
         endpoint_id: endpoint_id_str,
+        name: read_node_name(),
         proxy_url: format!("http://127.0.0.1:{}", args.proxy_port),
         upstream_url: upstream.clone().unwrap_or_default(),
         alpns: vec!["mtw/health/0".into(), "mtw/infer/0".into()],
@@ -428,10 +481,15 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
     // Run the iroh mesh + the HTTP proxy concurrently. First error wins OR
     // a shutdown signal aborts both and we drop the engine to propagate
     // `kill_on_drop` to the SwiftLM child.
+    // Swarm-discovery registry, shared: serve::run populates it (gossip), the
+    // proxy serves it at /discovered.
+    let discovered = mtw_core::gossip::Discovered::default();
     let mesh_engine = engine.clone();
     let mesh_layer_peer = layer_peer.clone();
+    let mesh_name = read_node_name();
+    let mesh_discovered = discovered.clone();
     let mut mesh_handle = tokio::spawn(async move {
-        mtw_core::serve::run(secret, mesh_engine, mesh_layer_peer).await
+        mtw_core::serve::run(secret, mesh_engine, mesh_layer_peer, mesh_name, mesh_discovered).await
     });
 
     // We always start the proxy so /status and /healthz are available; even
@@ -447,6 +505,8 @@ async fn serve_cmd(args: ServeArgs) -> anyhow::Result<()> {
         trace_log_path: Some(
             std::env::var("MTW_SWIFTLM_LOG").unwrap_or_else(|_| "/tmp/mtw-swiftlm.log".into()),
         ),
+        chat_engine,
+        discovered: Some(discovered.clone()),
     });
     let mut proxy_handle = proxy_cfg.map(|cfg| tokio::spawn(async move { mtw_api::run(cfg).await }));
 
@@ -552,6 +612,42 @@ async fn engine_is_up() -> bool {
 /// model, default SwiftLM binary). Returns `None` if either prereq is
 /// missing — caller should let the dashboard banner say so instead of
 /// trying to spawn an engine that will fail.
+/// This node's display name: `~/.mtw/name` if set, else the machine hostname.
+fn read_node_name() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        if let Ok(n) = std::fs::read_to_string(std::path::Path::new(&home).join(".mtw").join("name")) {
+            let t = n.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
+        }
+    }
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().trim_end_matches(".local").to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "node".into())
+}
+
+/// Parse a `"start,end"` layer range like `"24,48"`.
+fn parse_layer_range(s: &str) -> Option<(usize, usize)> {
+    let (a, b) = s.split_once(',')?;
+    Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+}
+
+/// Read `num_hidden_layers` from a model dir's `config.json`.
+fn read_num_layers(model_dir: &std::path::Path) -> anyhow::Result<usize> {
+    let txt = std::fs::read_to_string(model_dir.join("config.json"))
+        .with_context(|| format!("read {}/config.json", model_dir.display()))?;
+    let v: serde_json::Value = serde_json::from_str(&txt)?;
+    v.get("num_hidden_layers")
+        .and_then(|x| x.as_u64())
+        .map(|x| x as usize)
+        .context("config.json has no num_hidden_layers")
+}
+
 fn default_serve_args_or_none() -> Option<ServeArgs> {
     let swiftlm = default_swiftlm_binary();
     let model = default_model_dir();
@@ -571,6 +667,8 @@ fn default_serve_args_or_none() -> Option<ServeArgs> {
         attach: None,
         draft_model: None,
         num_draft_tokens: 4,
+        layer_range: None,
+        split_peer: None,
     })
 }
 
@@ -663,6 +761,8 @@ async fn start_cmd(args: StartArgs) -> anyhow::Result<()> {
         attach: None,
         draft_model: None,
         num_draft_tokens: 4,
+        layer_range: None,
+        split_peer: None,
     };
     let serve_handle = tokio::spawn(serve_cmd(serve_args));
 

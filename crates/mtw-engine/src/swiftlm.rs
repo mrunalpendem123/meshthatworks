@@ -50,6 +50,9 @@ pub struct SwiftLMOptions {
     pub ssd_prefetch: bool,
     pub draft_model_dir: Option<PathBuf>,
     pub extra_args: Vec<String>,
+    /// When set, the child loads ONLY layers `[start, end)` of the model via the
+    /// `MTW_LAYER_RANGE` env var — the per-node slice for layer-split inference.
+    pub layer_range: Option<(usize, usize)>,
 }
 
 impl SwiftLMOptions {
@@ -63,6 +66,7 @@ impl SwiftLMOptions {
             ssd_prefetch: true,
             draft_model_dir: None,
             extra_args: Vec::new(),
+            layer_range: None,
         }
     }
 
@@ -141,12 +145,18 @@ impl SwiftLMEngine {
             .open(&log_path)
             .with_context(|| format!("open SwiftLM log {log_path}"))?;
         let stderr_log = stdout_log.try_clone()?;
-        let child = Command::new(&opts.binary)
+        let mut command = Command::new(&opts.binary);
+        command
             .args(&args)
             .current_dir(&binary_dir)
             .kill_on_drop(true)
             .stdout(std::process::Stdio::from(stdout_log))
-            .stderr(std::process::Stdio::from(stderr_log))
+            .stderr(std::process::Stdio::from(stderr_log));
+        if let Some((lo, hi)) = opts.layer_range {
+            command.env("MTW_LAYER_RANGE", format!("{lo},{hi}"));
+            tracing::info!(lo, hi, "SwiftLM slice: MTW_LAYER_RANGE={lo},{hi}");
+        }
+        let child = command
             .spawn()
             .with_context(|| format!("spawn {}", opts.binary.display()))?;
 

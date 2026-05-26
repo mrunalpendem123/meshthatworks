@@ -18,6 +18,18 @@ body {
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   scroll-behavior: smooth;
+  /* Stop any wide child (globe, ASCII diagram) from causing a horizontal
+     scroll / right-side gap on mobile. `clip` is more reliable than `hidden`
+     (it doesn't create a scroll container that can leak). */
+  overflow-x: clip;
+  max-width: 100%;
+}
+
+#__next,
+main,
+body > div {
+  max-width: 100%;
+  overflow-x: clip;
 }
 
 ::selection {

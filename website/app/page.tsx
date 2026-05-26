@@ -8,9 +8,15 @@ import { MeshMark } from '@/components/Brand';
 const REPO = 'https://github.com/mrunalpendem123/meshthatworks';
 const RELEASES = `${REPO}/releases/latest`;
 // Direct-download URL: GitHub 302s straight to the asset with a download header.
-const DMG = `${REPO}/releases/latest/download/MeshThatWorks_0.1.0_aarch64.dmg`;
+// The split-capable build, shipped as a .zip (unzip → right-click Open, or
+// `xattr -dr com.apple.quarantine` for the un-notarized app).
+const DMG = `${REPO}/releases/latest/download/MeshThatWorks.zip`;
 const INSTALL_CMD =
   'curl -fsSL https://raw.githubusercontent.com/mrunalpendem123/meshthatworks/master/scripts/bootstrap.sh | sh';
+// Run once after downloading — the app isn't App-Store-notarized, so this clears
+// the quarantine flag and opens it.
+const OPEN_CMD =
+  'cd ~/Downloads && unzip -o MeshThatWorks.zip && xattr -dr com.apple.quarantine MeshThatWorks.app && open MeshThatWorks.app';
 
 export default function Page() {
   return (
@@ -20,7 +26,7 @@ export default function Page() {
       {/* ───────────────────────────── hero */}
       <header className="relative overflow-hidden">
         {/* globe drifting up behind the hero */}
-        <div className="pointer-events-none absolute left-1/2 top-[46%] -translate-x-1/2 -translate-y-1/2 opacity-90">
+        <div className="pointer-events-none absolute left-1/2 top-[46%] -translate-x-1/2 -translate-y-1/2 opacity-50 sm:opacity-90">
           <Globe size={680} />
         </div>
 
@@ -181,6 +187,10 @@ export default function Page() {
                 <a href={DMG} className="pill pill-primary mt-4 px-5 py-2.5 text-[14px] no-underline">
                   ↓ Download for Mac
                 </a>
+                <p className="mt-4 text-[12px] text-ink-3">Then run this once to open it:</p>
+                <div className="mt-2 rounded-xl border border-line bg-black/40 p-3">
+                  <CopyableCommand cmd={OPEN_CMD} />
+                </div>
               </div>
 
               <div className="rounded-2xl border border-line bg-white/[0.02] p-6">

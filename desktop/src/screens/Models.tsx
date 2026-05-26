@@ -5,8 +5,8 @@ import {
   downloadModel,
   listInstalledModels,
   onDownloadProgress,
-  restartEngine,
   setActiveModel,
+  setSplitMode,
 } from '../lib/api';
 import type { DownloadProgress, InstalledModel } from '../lib/types';
 import { useApp } from '../lib/store';
@@ -47,7 +47,8 @@ export function Models({ onActivated }: { onActivated?: () => void }) {
     try {
       await setActiveModel(dirName);
       await refresh();
-      if (setup?.swiftlmInstalled) await restartEngine().catch(() => {});
+      // Switching model returns to single-node (resets any split role) + restarts.
+      if (setup?.swiftlmInstalled) await setSplitMode('off').catch(() => {});
       onActivated?.();
     } finally {
       setBusy(null);
@@ -60,7 +61,7 @@ export function Models({ onActivated }: { onActivated?: () => void }) {
     try {
       await downloadModel(repo, dirName);
       await refresh();
-      if (setup?.swiftlmInstalled) await restartEngine().catch(() => {});
+      if (setup?.swiftlmInstalled) await setSplitMode('off').catch(() => {});
       onActivated?.();
     } catch (e) {
       console.error(e);

@@ -45,14 +45,28 @@ fn metal_available() -> bool {
         .unwrap_or(false)
 }
 
+/// True only if `dir` contains real weights (`.safetensors`), not just a
+/// config — i.e. a complete download, not a half-finished one.
+fn dir_has_weights(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map_or(false, |x| x == "safetensors"))
+        })
+        .unwrap_or(false)
+}
+
 fn read_active_model() -> Option<PathBuf> {
     let raw = std::fs::read_to_string(paths::active_model_file()).ok()?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
+        return None;
     }
+    let dir = PathBuf::from(trimmed);
+    // Never report a not-downloaded model as active — a config-only path is a
+    // failed/partial download and would make the UI show "Active" with no
+    // weights for the engine to load.
+    dir_has_weights(&dir).then_some(dir)
 }
 
 #[tauri::command]
@@ -111,7 +125,16 @@ fn installed_model_dirs() -> Vec<PathBuf> {
     if let Ok(rd) = std::fs::read_dir(paths::models_dir()) {
         for entry in rd.flatten() {
             let p = entry.path();
-            if p.is_dir() && p.join("config.json").is_file() {
+            // Require weights, not just config — a config-only dir is a
+            // half-finished download and must show as "not installed" so the UI
+            // offers a Download (not "Use this model").
+            let has_weights = std::fs::read_dir(&p)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().map_or(false, |x| x == "safetensors"))
+                })
+                .unwrap_or(false);
+            if p.is_dir() && p.join("config.json").is_file() && has_weights {
                 out.push(p);
             }
         }
@@ -159,6 +182,17 @@ pub fn set_active_model(dir_name: String) -> Result<String, String> {
     }
     if !dir.join("config.json").is_file() {
         return Err(format!("{dir_name} has no config.json"));
+    }
+    // Require actual weights — config.json alone means a half-finished download,
+    // which would silently activate a model the engine can't load.
+    let has_weights = std::fs::read_dir(&dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .any(|e| e.path().extension().map_or(false, |x| x == "safetensors"))
+        })
+        .unwrap_or(false);
+    if !has_weights {
+        return Err(format!("{dir_name} isn't fully downloaded yet (no .safetensors)"));
     }
     let abs = dir
         .canonicalize()
@@ -343,6 +377,56 @@ pub async fn restart_engine(app: AppHandle, engine: State<'_, Engine>) -> Result
     engine.stop().await?;
     tokio::time::sleep(std::time::Duration::from_millis(900)).await;
     engine.start(&app).await
+}
+
+/// Set this node's layer-split role and restart the engine so it takes effect.
+/// role = "off" | "head" | "worker"; `peer` is the worker's endpoint id (head only).
+#[tauri::command]
+pub async fn set_split_mode(
+    app: AppHandle,
+    engine: State<'_, Engine>,
+    role: String,
+    peer: Option<String>,
+) -> Result<(), String> {
+    use crate::engine::SplitMode;
+    let mode = match role.as_str() {
+        "head" => SplitMode::Head(peer.ok_or("head mode needs a peer endpoint id")?),
+        "worker" => SplitMode::Worker,
+        _ => SplitMode::Off,
+    };
+    engine.set_split(mode).await;
+    engine.stop().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(900)).await;
+    engine.start(&app).await
+}
+
+/// Current split role label, for the UI.
+#[tauri::command]
+pub async fn split_status(engine: State<'_, Engine>) -> Result<String, String> {
+    Ok(engine.split_label().await)
+}
+
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoveredNode {
+    pub endpoint_id: String,
+    pub name: String,
+    pub model: String,
+    pub age_secs: u64,
+}
+
+/// Live list of swarm nodes the engine has discovered over gossip (named, no
+/// invite codes). Empty if the engine isn't up yet.
+#[tauri::command]
+pub async fn discovered_nodes() -> Result<Vec<DiscoveredNode>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .map_err(|e| e.to_string())?;
+    match client.get(format!("{}/discovered", crate::engine::PROXY_URL)).send().await {
+        Ok(r) => r.json().await.map_err(|e| e.to_string()),
+        Err(_) => Ok(Vec::new()), // engine not up yet — show empty, not an error
+    }
 }
 
 #[tauri::command]

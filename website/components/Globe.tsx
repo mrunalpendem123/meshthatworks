@@ -59,10 +59,11 @@ export function Globe({ size = 560, speed = 0.0026, className }: GlobeProps) {
       ref={canvasRef}
       className={className}
       style={{
-        width: size,
-        height: size,
-        maxWidth: '100%',
-        aspectRatio: '1',
+        // Clamp BOTH dimensions to the viewport so the canvas stays square on
+        // mobile (a fixed height with a clamped width made it non-square →
+        // the globe rendered off-center / stretched).
+        width: `min(${size}px, 78vw)`,
+        height: `min(${size}px, 78vw)`,
         cursor: 'grab',
         opacity: 0,
         transition: 'opacity 1.2s ease',

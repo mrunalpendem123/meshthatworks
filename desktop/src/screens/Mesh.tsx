@@ -3,6 +3,7 @@ import { Check, Copy, Link2, Plus, Radio, X } from 'lucide-react';
 import { Globe, peerMarkers } from '../components/Globe';
 import { GlowButton, Spinner, StatusDot } from '../components/ui';
 import {
+  discoveredNodes,
   joinMesh,
   listPeers,
   onPairInvite,
@@ -10,7 +11,10 @@ import {
   onPairSuccess,
   pairCancel,
   pairStart,
+  setSplitMode,
+  splitStatus,
 } from '../lib/api';
+import type { DiscoveredNode } from '../lib/api';
 import type { PeerInfo } from '../lib/types';
 import { useApp } from '../lib/store';
 import { shortId } from '../lib/util';
@@ -26,11 +30,27 @@ export function Mesh() {
   const [joinInput, setJoinInput] = useState('');
   const [joining, setJoining] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [splitLabel, setSplitLabel] = useState('off');
+  const [discovered, setDiscovered] = useState<DiscoveredNode[]>([]);
 
   const refresh = () => listPeers().then(setPeers);
 
+  async function applySplit(role: 'off' | 'head' | 'worker', peer?: string) {
+    setError(null);
+    setSplitLabel(role === 'head' ? `head→${shortId(peer, 6, 4)}` : role);
+    try {
+      await setSplitMode(role, peer);
+      setTimeout(() => splitStatus().then(setSplitLabel).catch(() => {}), 1800);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
   useEffect(() => {
     refresh();
+    splitStatus().then(setSplitLabel).catch(() => {});
+    discoveredNodes().then(setDiscovered).catch(() => {});
+    const poll = setInterval(() => discoveredNodes().then(setDiscovered).catch(() => {}), 5000);
     const a = onPairInvite((inv) => setInvite(inv));
     const b = onPairLog((line) => setPairLog(line));
     const c = onPairSuccess(() => {
@@ -39,6 +59,7 @@ export function Mesh() {
       refresh();
     });
     return () => {
+      clearInterval(poll);
       [a, b, c].forEach((p) => p.then((f) => f()));
     };
   }, []);
@@ -101,6 +122,61 @@ export function Mesh() {
           </div>
         </div>
 
+        {/* split-mode control */}
+        <div className="glass mt-3 rounded-2xl p-4">
+          <div className="flex items-center justify-between">
+            <div className="text-[12.5px] text-ink-2">
+              Split mode: <span className="font-mono text-ink-0">{splitLabel}</span>
+            </div>
+            <div className="flex gap-2">
+              <button onClick={() => applySplit('worker')} className="pill px-3 py-1 text-[12px] text-ink-1">
+                Be worker
+              </button>
+              <button onClick={() => applySplit('off')} className="pill px-3 py-1 text-[12px] text-ink-2">
+                Single
+              </button>
+            </div>
+          </div>
+          <p className="mt-2 text-[11px] leading-relaxed text-ink-3">
+            Run one big model across both Macs: on the other Mac click <b>Be worker</b>; here, click
+            <b> Split&nbsp;here</b> next to it. Then chat — the model splits across both over iroh.
+            (Engine restarts; both need the same model.)
+          </p>
+        </div>
+
+        {/* discovered swarm nodes (live, over gossip — no invite codes) */}
+        <div className="mt-4 mb-2 flex items-center justify-between">
+          <h2 className="text-[15px] font-semibold text-ink-0">
+            Online now <span className="text-ink-3">· {discovered.length}</span>
+          </h2>
+          <span className="text-[11px] text-ink-3">discovered · no codes</span>
+        </div>
+        <div className="space-y-2">
+          {discovered.length === 0 ? (
+            <p className="text-[12px] text-ink-3">
+              No other nodes online yet. Pair once to join the swarm — after that, everyone on it
+              shows up here automatically.
+            </p>
+          ) : (
+            discovered.map((d) => (
+              <div key={d.endpointId} className="glass flex items-center gap-3 rounded-xl px-4 py-3">
+                <span className="h-2 w-2 rounded-full bg-node shadow-node" />
+                <div className="min-w-0 flex-1">
+                  <div className="truncate text-[13px] text-ink-0">{d.name}</div>
+                  <div className="truncate text-[11px] text-ink-3">{d.model}</div>
+                </div>
+                <button
+                  onClick={() => applySplit('head', d.endpointId)}
+                  className="pill px-2.5 py-1 text-[11px] text-node"
+                  title="Split a model across both, driven from here"
+                >
+                  Split here
+                </button>
+              </div>
+            ))
+          )}
+        </div>
+
         <div className="mt-5 mb-3 flex items-center justify-between">
           <h2 className="text-[15px] font-semibold text-ink-0">
             Paired devices <span className="text-ink-3">· {peers.length}</span>
@@ -123,8 +199,15 @@ export function Mesh() {
                 <span className="flex-1 truncate font-mono text-[13px] text-ink-0">
                   {shortId(p.id, 12, 8)}
                 </span>
+                <button
+                  onClick={() => applySplit('head', p.id)}
+                  className="pill px-2.5 py-1 text-[11px] text-node"
+                  title="Split a model across both Macs, driven from here"
+                >
+                  Split here
+                </button>
                 <span className="text-[11px] text-ink-3">
-                  paired {new Date(p.pairedAt * 1000).toLocaleDateString()}
+                  {new Date(p.pairedAt * 1000).toLocaleDateString()}
                 </span>
               </div>
             ))

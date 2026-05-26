@@ -28,7 +28,7 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use iroh::{
     Endpoint, EndpointAddr, EndpointId,
-    endpoint::Connection,
+    endpoint::{Connection, presets},
     protocol::{AcceptError, ProtocolHandler},
 };
 use mtw_engine::{ActivationTensor, LayerPeer};
@@ -233,4 +233,20 @@ impl LayerPeer for IrohLayerPeer {
 
 fn bincode_config() -> bincode::config::Configuration {
     bincode::config::standard()
+}
+
+/// Build a `LayerPeer` that dials `peer_id` over a fresh ephemeral iroh endpoint
+/// (its own random identity, so it never collides with the node's main serve
+/// endpoint on the relay). Used by a split HEAD to pipeline its upper layers to
+/// a paired worker.
+pub async fn dial_layer_peer(peer_id: &str) -> anyhow::Result<Arc<dyn LayerPeer>> {
+    let id: EndpointId = peer_id
+        .trim()
+        .parse()
+        .with_context(|| format!("parse split-peer endpoint id '{peer_id}'"))?;
+    let endpoint = Endpoint::builder(presets::N0)
+        .bind()
+        .await
+        .context("bind ephemeral split-client endpoint")?;
+    Ok(Arc::new(IrohLayerPeer::new(endpoint, id)) as Arc<dyn LayerPeer>)
 }

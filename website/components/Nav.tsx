@@ -1,7 +1,7 @@
 import { Wordmark } from './Brand';
 
 const REPO = 'https://github.com/mrunalpendem123/meshthatworks';
-const DMG = `${REPO}/releases/latest/download/MeshThatWorks_0.1.0_aarch64.dmg`;
+const DMG = `${REPO}/releases/latest/download/MeshThatWorks.zip`;
 
 export function Nav() {
   return (

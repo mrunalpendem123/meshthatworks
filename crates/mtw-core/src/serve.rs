@@ -7,9 +7,11 @@
 use std::sync::Arc;
 
 use anyhow::Context;
-use iroh::{Endpoint, SecretKey, endpoint::presets, protocol::Router};
+use iroh::{Endpoint, EndpointId, SecretKey, endpoint::presets, protocol::Router};
+use iroh_gossip::net::GOSSIP_ALPN;
 use mtw_engine::{InferenceEngine, LayerPeer};
 
+use crate::gossip::{Discovered, build_gossip, run_discovery};
 use crate::health::{HEALTH_ALPN, HealthHandler};
 use crate::infer::{INFER_ALPN, InferHandler};
 use crate::layer::{LAYER_ALPN, LayerHandler};
@@ -19,6 +21,8 @@ pub async fn run(
     secret: SecretKey,
     engine: Arc<dyn InferenceEngine>,
     layer_peer: Option<Arc<dyn LayerPeer>>,
+    name: String,
+    discovered: Discovered,
 ) -> anyhow::Result<()> {
     let info = engine.model_info().clone();
     let endpoint = Endpoint::builder(presets::N0)
@@ -30,6 +34,9 @@ pub async fn run(
     endpoint.online().await;
     let id = endpoint.id();
 
+    // Swarm discovery: gossip presence on the shared room topic.
+    let gossip = build_gossip(endpoint.clone());
+
     let mut router_builder = Router::builder(endpoint)
         .accept(
             HEALTH_ALPN,
@@ -38,18 +45,37 @@ pub async fn run(
             },
         )
         .accept(INFER_ALPN, InferHandler::new(engine.clone()))
-        .accept(LAYER_ALPN, LayerHandler::new(engine.clone()));
+        .accept(LAYER_ALPN, LayerHandler::new(engine.clone()))
+        .accept(GOSSIP_ALPN, gossip.clone());
 
     let mut alpns = vec![
         std::str::from_utf8(HEALTH_ALPN).unwrap(),
         std::str::from_utf8(INFER_ALPN).unwrap(),
         std::str::from_utf8(LAYER_ALPN).unwrap(),
+        std::str::from_utf8(GOSSIP_ALPN).unwrap(),
     ];
     if let Some(peer) = layer_peer {
         router_builder = router_builder.accept(LAYER_FORWARD_ALPN, LayerForwardHandler::new(peer));
         alpns.push(std::str::from_utf8(LAYER_FORWARD_ALPN).unwrap());
     }
     let router = router_builder.spawn();
+
+    // Join the swarm room: bootstrap from already-paired peers, then broadcast
+    // our presence + record everyone else's into `discovered`.
+    let bootstrap: Vec<EndpointId> = crate::peers::load()
+        .map(|l| l.peers.iter().filter_map(|p| p.id.parse().ok()).collect())
+        .unwrap_or_default();
+    {
+        let disc = discovered.clone();
+        let gname = name.clone();
+        let gmodel = info.name.clone();
+        let gid = id.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = run_discovery(gossip, gname, gid, gmodel, bootstrap, disc).await {
+                tracing::warn!("gossip discovery ended: {e:#}");
+            }
+        });
+    }
 
     let peer_count = crate::peers::load()
         .map(|list| list.peers.len())

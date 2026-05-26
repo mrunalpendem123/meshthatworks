@@ -21,9 +21,59 @@ pub fn bundled_swiftlm(app: &AppHandle) -> Option<std::path::PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Kill any engine processes squatting our ports. `mtw serve`'s SwiftLM child is
+/// NOT reaped when we SIGKILL the sidecar, so without this a restart or model
+/// switch leaves an orphaned SwiftLM on 9876 that blocks the new engine from
+/// binding — the "node stuck on connecting" bug. Best-effort; ignores errors.
+/// Worker's layer slice (`N/2..N`) computed from the active model's config, so
+/// it loads the upper half while the head loads the lower half.
+fn worker_range_from_active_model() -> Option<(usize, usize)> {
+    let home = dirs::home_dir()?;
+    let active = std::fs::read_to_string(home.join(".mtw").join("active-model")).ok()?;
+    let dir = std::path::PathBuf::from(active.trim());
+    let cfg = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&cfg).ok()?;
+    // Only Qwen3 (dense + MoE) and Llama can slice. For anything else (lfm2_moe,
+    // olmoe, …) return None so the worker full-loads instead of failing to load
+    // a slice it doesn't support.
+    let arch = v.get("model_type").and_then(|x| x.as_str()).unwrap_or("");
+    if !matches!(arch, "qwen3" | "qwen3_moe" | "llama") {
+        return None;
+    }
+    let n = v.get("num_hidden_layers")?.as_u64()? as usize;
+    Some((n / 2, n))
+}
+
+fn free_engine_ports() {
+    use std::process::Command;
+    // The orphaned bundled SwiftLM child (matches Resources/swiftlm/SwiftLM).
+    let _ = Command::new("pkill").args(["-9", "-f", "swiftlm/SwiftLM"]).status();
+    // Backstop: kill whatever still holds the engine/proxy ports.
+    for port in ["9876", "9337"] {
+        if let Ok(out) = Command::new("lsof").args(["-ti", &format!("tcp:{port}")]).output() {
+            for pid in String::from_utf8_lossy(&out.stdout).split_whitespace() {
+                let _ = Command::new("kill").args(["-9", pid]).status();
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Engine {
     inner: Mutex<EngineInner>,
+}
+
+/// How this node participates in a layer-split across paired devices.
+#[derive(Clone, Default, PartialEq)]
+pub enum SplitMode {
+    /// Single-node — run the whole model locally.
+    #[default]
+    Off,
+    /// Drive generation: run layers `0..N/2` locally, pipeline the rest to this
+    /// peer (its endpoint id) over iroh.
+    Head(String),
+    /// Serve layers `N/2..N` over iroh for a paired head.
+    Worker,
 }
 
 #[derive(Default)]
@@ -32,6 +82,8 @@ struct EngineInner {
     /// Whether the user wants the engine up. Drives the poller's "stopped"
     /// vs "starting" interpretation when no health response is available yet.
     intended: bool,
+    /// Layer-split role this node should (re)start in.
+    split: SplitMode,
 }
 
 #[derive(Clone, Serialize)]
@@ -54,6 +106,20 @@ impl Engine {
         self.inner.lock().await.intended
     }
 
+    /// Set the layer-split role applied on the next (re)start.
+    pub async fn set_split(&self, mode: SplitMode) {
+        self.inner.lock().await.split = mode;
+    }
+
+    /// Short label of the current split role, for the UI.
+    pub async fn split_label(&self) -> String {
+        match &self.inner.lock().await.split {
+            SplitMode::Off => "off".into(),
+            SplitMode::Head(p) => format!("head→{}", &p[..p.len().min(12)]),
+            SplitMode::Worker => "worker".into(),
+        }
+    }
+
     /// Spawn `mtw serve` if it is not already running.
     pub async fn start(&self, app: &AppHandle) -> Result<(), String> {
         let mut g = self.inner.lock().await;
@@ -62,11 +128,31 @@ impl Engine {
             return Ok(());
         }
 
+        // Clear any orphaned engine from a prior crash or hard kill (a SIGKILL'd
+        // `mtw serve` leaves its SwiftLM child on 9876) so the new one can bind.
+        free_engine_ports();
+        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+
         // Use the bundled SwiftLM if present so the app is self-contained.
         let mut args: Vec<String> = vec!["serve".into()];
         if let Some(slm) = bundled_swiftlm(app) {
             args.push("--swiftlm".into());
             args.push(slm.to_string_lossy().into_owned());
+        }
+        // Layer-split flags: head pipelines to a peer over iroh; worker serves
+        // its upper slice. Off → normal single-node serve.
+        match &g.split {
+            SplitMode::Off => {}
+            SplitMode::Head(peer) => {
+                args.push("--split-peer".into());
+                args.push(peer.clone());
+            }
+            SplitMode::Worker => {
+                if let Some((lo, hi)) = worker_range_from_active_model() {
+                    args.push("--layer-range".into());
+                    args.push(format!("{lo},{hi}"));
+                }
+            }
         }
         let cmd = app
             .shell()
@@ -121,8 +207,11 @@ impl Engine {
         let mut g = self.inner.lock().await;
         g.intended = false;
         if let Some(child) = g.child.take() {
-            child.kill().map_err(|e| format!("kill mtw serve: {e}"))?;
+            let _ = child.kill();
         }
+        // Reap the orphaned SwiftLM child (the sidecar's SIGKILL doesn't), so a
+        // following start() can bind the ports cleanly.
+        free_engine_ports();
         Ok(())
     }
 }

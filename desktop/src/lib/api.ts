@@ -25,6 +25,21 @@ export const stopEngine = () => invoke<void>('stop_engine');
 export const restartEngine = () => invoke<void>('restart_engine');
 export const nodeStatus = () => invoke<NodeStatus>('node_status');
 
+// Layer-split across paired devices. 'head' drives generation + pipelines the
+// upper layers to `peer` over iroh; 'worker' serves its slice; 'off' = single.
+export const setSplitMode = (role: 'off' | 'head' | 'worker', peer?: string) =>
+  invoke<void>('set_split_mode', { role, peer });
+export const splitStatus = () => invoke<string>('split_status');
+
+export interface DiscoveredNode {
+  endpointId: string;
+  name: string;
+  model: string;
+  ageSecs: number;
+}
+// Live swarm: named nodes seen over gossip (no invite codes).
+export const discoveredNodes = () => invoke<DiscoveredNode[]>('discovered_nodes');
+
 export const listPeers = () => invoke<PeerInfo[]>('list_peers');
 export const pairStart = () => invoke<void>('pair_start');
 export const pairCancel = () => invoke<void>('pair_cancel');
