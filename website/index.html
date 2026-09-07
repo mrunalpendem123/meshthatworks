@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MeshThatWorks — adaptive collective inference</title>
+<meta name="description" content="A cluster of consumer devices, each running a complete small language model. The mesh measures where the collective is uncertain and sends one targeted follow-up to the node best placed to resolve it.">
+<style>
+  :root { --bg:#0b0e14; --card:#121724; --line:#232b3d; --txt:#e8ecf4; --dim:#8b95ab;
+          --acc:#5eead4; --warn:#fbbf24; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--txt);
+         font:16px/1.65 ui-monospace, SFMono-Regular, Menlo, monospace;
+         -webkit-font-smoothing:antialiased; }
+  .wrap { max-width:720px; margin:0 auto; padding:64px 20px 80px; }
+  h1 { font-size:26px; font-weight:600; margin:0; letter-spacing:-.5px; }
+  h1 span { color:var(--acc); }
+  .tag { color:var(--dim); font-size:14px; margin:6px 0 44px; }
+  h2 { font-size:14px; color:var(--acc); text-transform:uppercase; letter-spacing:2px;
+       margin:52px 0 14px; font-weight:600; }
+  p { margin:0 0 16px; color:#c9d1e0; }
+  b { color:var(--txt); }
+  .claim { border-left:3px solid var(--acc); padding:14px 18px; background:var(--card);
+           border-radius:0 10px 10px 0; margin:20px 0; font-size:17px; }
+  .claim small { display:block; color:var(--dim); margin-top:8px; font-size:13px; }
+  pre { background:var(--card); border:1px solid var(--line); border-radius:10px;
+        padding:18px; overflow-x:auto; font-size:13.5px; line-height:1.7; color:#c9d1e0; }
+  pre .hi { color:var(--acc); }
+  .not { display:flex; gap:12px; flex-wrap:wrap; margin:18px 0; }
+  .not div { flex:1 1 240px; background:var(--card); border:1px solid var(--line);
+             border-radius:10px; padding:14px 16px; font-size:14px; color:var(--dim); }
+  .not b { color:var(--warn); display:block; margin-bottom:4px; font-size:13px; }
+  table { width:100%; border-collapse:collapse; font-size:14px; }
+  td, th { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); }
+  th { color:var(--dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:1px; }
+  td:first-child { color:var(--acc); white-space:nowrap; }
+  .st { white-space:nowrap; }
+  a { color:var(--acc); text-decoration:none; border-bottom:1px solid #2a4f48; }
+  a:hover { border-bottom-color:var(--acc); }
+  .links { margin-top:56px; display:flex; gap:22px; flex-wrap:wrap; font-size:14px; }
+  footer { margin-top:60px; color:var(--dim); font-size:12.5px; border-top:1px solid var(--line);
+           padding-top:18px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>mesh<span>that</span>works</h1>
+  <div class="tag">adaptive collective inference on heterogeneous edge devices</div>
+
+  <p>A small cluster of consumer devices — phones, laptops — each running a
+  <b>complete</b> small language model from a different model family. A prompt is
+  answered by all of them in parallel. The system measures where the collective is
+  uncertain, decides which single node is best placed to resolve that uncertainty,
+  sends <b>one targeted follow-up to that node only</b>, and synthesizes a final
+  answer. No cloud. Nothing leaves the local network.</p>
+
+  <div class="claim">
+    Every existing uncertainty-routing system assumes a stronger model exists to
+    escalate to. This one does not.
+    <small>There is no oracle. Selection is among equals — on complementary
+    strengths, not a capability ordering — and the extra pass costs battery on a
+    device someone is holding. The headline metric is quality per joule.</small>
+  </div>
+
+  <div class="not">
+    <div><b>not model sharding</b>Not one large model split across devices.
+      Every node runs a whole model and can answer alone.</div>
+    <div><b>not mixture-of-agents</b>No blind aggregation of everything.
+      Diagnosis first, then exactly one extra inference where it counts.</div>
+  </div>
+
+  <h2>the mechanism</h2>
+<pre>prompt
+  → fan out to N nodes, K samples each
+  → semantic clustering <span class="hi">(bidirectional entailment)</span>
+  → cross-node divergence           <span class="hi">→ is there a gap?</span>
+  → per-node entropy, calibrated    <span class="hi">→ who resolves it?</span>
+  → cost check                      <span class="hi">→ is it worth the battery?</span>
+  → one targeted second inference
+  → synthesis <span class="hi">(node-class model only)</span></pre>
+  <p style="font-size:14px;color:var(--dim)">The gap detector is semantic entropy
+  (Farquhar et&nbsp;al., <i>Nature</i> 2024). It normally costs 5–10× compute for the
+  extra samples — but a mesh generates multiple answers in parallel anyway, so the
+  expensive part is free by construction.</p>
+
+  <h2>where it stands</h2>
+  <table>
+    <tr><th>stage</th><th>what</th><th class="st">status</th></tr>
+    <tr><td>1–3</td><td>offline harness: generation, detector AUROC, 7-condition ablation</td><td class="st">built</td></tr>
+    <tr><td>web</td><td>live browser mesh — any phone or laptop joins via a URL, model runs in the browser (WebGPU)</td><td class="st">built</td></tr>
+    <tr><td>4</td><td>two machines, real latency</td><td class="st">planned</td></tr>
+    <tr><td>5</td><td>phones on NPUs, measured joules</td><td class="st">planned</td></tr>
+  </table>
+  <p style="margin-top:14px;font-size:14px;color:var(--dim)">If coordination loses
+  to plain self-consistency at equal compute, the premise fails — and that negative
+  result, properly measured, is the publication. The kill criteria are in the spec.</p>
+
+  <div class="links">
+    <a href="https://github.com/mrunalpendem123/meshthatworks">github</a>
+    <a href="https://github.com/mrunalpendem123/meshthatworks/blob/master/docs/SPEC.md">the spec</a>
+    <a href="https://github.com/mrunalpendem123/meshthatworks/tree/master/harness">the harness</a>
+  </div>
+
+  <footer>MIT · the previous MeshThatWorks (SSD-streaming layer-split on Macs) lives on the
+  <a href="https://github.com/mrunalpendem123/meshthatworks/tree/legacy-ssd-streaming">legacy branch</a></footer>
+</div>
+</body>
+</html>

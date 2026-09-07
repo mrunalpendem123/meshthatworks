@@ -46,10 +46,23 @@ The gap detector is built on **semantic entropy** (Farquhar et al., *Nature* 202
 | 1 | **Offline, single machine.** Four models via Ollama, K≈5 samples each, dump `generations.jsonl` over TriviaQA + GSM8K. Run the heterogeneity-vs-self-consistency baseline. | `harness/` — built |
 | 2 | **Detector validation.** Cross-node divergence + per-node normalized entropy vs. actual error. Report AUROC. *This is the entire scientific risk and it costs nothing.* AUROC < 0.6 → stop and rethink. | `harness/` — built |
 | 3 | **Routing, still offline.** Full 7-condition ablation over saved generations. One CSV, one plot. | `harness/` — built |
+| web | **Live browser mesh.** Any phone/laptop opens a URL, loads a model in the browser (WebLLM/WebGPU), joins over WebSocket; the coordinator runs the real gap→select→second-pass loop. | `mesh-web/` — built |
 | 4 | **Two machines via NVIDIA PAIR.** Coordinator as a client in front of PAIR's proxy. | planned |
 | 5 | **Phones.** Phonon sidecar for NPU inference; Iroh + `iroh-gossip` transport; energy/thermal/bandwidth measurement. | planned |
 
 Stages 1–3 produce a paper without a single phone purchased. Stages 4–5 make it a system.
+
+## Try it live with your own devices
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r harness/requirements.txt fastapi 'uvicorn[standard]' websockets
+.venv/bin/python mesh-web/server.py               # coordinator on :8020
+cloudflared tunnel --url http://localhost:8020    # HTTPS URL for phones (WebGPU needs it)
+```
+
+Open the URL on every device, pick a model per device (different families!), join,
+and ask. Each round shows every node's answers, per-node semantic entropy, the gap
+verdict, the one selected node, and the synthesized answer. Details: [`mesh-web/README.md`](mesh-web/README.md).
 
 ## Running the offline harness (stages 1–3)
 

@@ -5,3 +5,7 @@
 __pycache__/
 *.pyc
 harness/data/
+.gstack/
+.venv/
+website/.vercel/
+.env*.local
