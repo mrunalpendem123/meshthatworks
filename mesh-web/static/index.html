@@ -298,15 +298,17 @@ function handle(msg) {
              c.textContent = `${msg.name} ${msg.ok ? "✓" : "✗ no answer"}`; }
   } else if (msg.phase === "analysis") {
     el.querySelector(".s2").classList.add("on");
+    const vc = Object.entries(msg.view_counts || {}).sort()
+      .map(([v, c]) => `view ${v} ×${c}`).join(" · ");
     el.querySelector(".s2 .t").innerHTML = msg.gap
-      ? `<span class="warn">devices disagree — ${msg.n_views} different views</span>`
+      ? `<span class="warn">devices disagree — ${msg.n_views} views (${vc})</span>`
       : `<span class="ok">all devices see it the same way</span>`;
     el.dataset.perNode = JSON.stringify(msg.per_node);
   } else if (msg.phase === "second_pass") {
     const s3 = el.querySelector(".s3");
     s3.style.display = ""; s3.classList.add("on");
     s3.querySelector(".t").innerHTML =
-      `<b>${esc(msg.name)}</b> (${esc(msg.reason)}) is reading everyone's answers and writing the final one…`;
+      `<b>${esc(msg.name)}</b> · ${esc(msg.model || "")} (${esc(msg.reason)}) is reading all drafts and writing the final answer…`;
   } else if (msg.phase === "final") {
     renderFinal(el, msg);
   } else if (msg.phase === "error") {
@@ -318,10 +320,12 @@ function handle(msg) {
 function renderFinal(el, msg) {
   $("ask").disabled = false;
   const mine = msg.per_node[nodeId];
+  const n = Object.keys(msg.per_node).length;
+  const majority = Math.max(...Object.values(msg.view_counts || {1:1}));
   const by = msg.final_how === "synthesized"
-    ? `written by <b>${esc(msg.final_by.name)}</b> (${esc(msg.final_by.model)}) after reading all ${Object.keys(msg.per_node).length} answers`
+    ? `${majority} of ${n} drafts agreed · <b>${esc(msg.final_by.model)}</b> (strongest device, ${esc(msg.final_by.name)}) merged all ${n}`
     : msg.final_how === "consensus"
-    ? `all devices agreed — steadiest answer shown (${esc(msg.final_by.name)})`
+    ? `all ${n} devices agreed — strongest device's answer shown (${esc(msg.final_by.model)}, ${esc(msg.final_by.name)})`
     : `${esc(msg.final_by.name)}'s answer (${esc(msg.final_how)})`;
 
   let html = `
@@ -338,7 +342,7 @@ function renderFinal(el, msg) {
       <div class="node-grid">${Object.entries(msg.per_node).map(([nid, a]) => `
         <div class="node-card${nid === msg.final_by.id ? " selected" : ""}">
           <b>${esc(a.name)} · ${esc(a.model)}</b>
-          <span class="va">view ${a.view}</span>${nid === msg.final_by.id ? `<span class="va" style="color:var(--acc)">synthesizer</span>` : ""}
+          <span class="va">view ${a.view}${a.agrees ? ` · +${a.agrees} agree` : ""}</span>${nid === msg.final_by.id ? `<span class="va" style="color:var(--acc)">wrote the final</span>` : ""}
           <div class="prose">${esc(a.answer)}</div>
           <small>one-liners: ${a.probes.map(esc).join(" · ")}</small><br>
           <small>steadiness H=${a.entropy_raw}${a.calibrated ? ` (z=${a.entropy_z})` : ""} · ${a.tokens} tok</small>

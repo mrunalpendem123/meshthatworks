@@ -15,10 +15,10 @@ import json
 import websockets
 
 
-async def run(name: str, answers: list[str], url: str):
+async def run(name: str, answers: list[str], url: str, model: str):
     async with websockets.connect(url) as ws:
         await ws.send(json.dumps({"type": "register", "name": name,
-                                  "model": f"mock-{name}", "device": "mock"}))
+                                  "model": model, "device": "mock"}))
         cycle = itertools.cycle(answers)
         async for raw in ws:
             msg = json.loads(raw)
@@ -38,5 +38,8 @@ if __name__ == "__main__":
     ap.add_argument("--name", required=True)
     ap.add_argument("--answers", required=True, help="comma-separated answer pool")
     ap.add_argument("--url", default="ws://localhost:8020/ws")
+    ap.add_argument("--model", default=None, help="model name to register as "
+                    "(capability is parsed from it, e.g. 'mock-Qwen2.5-0.5B')")
     args = ap.parse_args()
-    asyncio.run(run(args.name, args.answers.split(","), args.url))
+    asyncio.run(run(args.name, args.answers.split(","), args.url,
+                    args.model or f"mock-{args.name}"))

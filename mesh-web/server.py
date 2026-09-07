@@ -96,6 +96,25 @@ class Mesh:
 mesh = Mesh()
 
 
+def capability(model: str) -> float:
+    """Rough parameter count in billions, parsed from the model name. Used to pick
+    the synthesizer: the most capable device writes, so the final answer's ceiling
+    is the strongest model in the mesh, not the most confident one."""
+    import re
+    m = model.lower()
+    if "phi-3" in m or "phi3" in m:
+        return 3.8
+    b = re.search(r"(\d+(?:\.\d+)?)b", m)
+    if b:
+        return float(b.group(1))
+    mm = re.search(r"(\d+)m(?![a-z])", m)
+    if mm:
+        return float(mm.group(1)) / 1000
+    if "mock" in m:
+        return 0.01
+    return 1.0
+
+
 def answer_prompt(question: str) -> str:
     return ("Answer the question below well, in at most 4 short sentences. "
             "Be concrete and correct; no filler, no headings.\n\n"
@@ -107,15 +126,18 @@ def probe_prompt(question: str) -> str:
             f"\n\nQuestion: {question}\nAnswer:")
 
 
-def synthesis_prompt(question: str, entries: list[tuple[str, str]]) -> str:
-    parts = "\n\n".join(f"[{model}]\n{ans[:500]}" for model, ans in entries)
-    return ("You are the synthesizer for a mesh of small AI models. They answered "
-            "this question independently:\n\n"
-            f"Question: {question}\n\n{parts}\n\n"
-            "Compare the answers: where they agree, trust them; where one adds a "
-            "correct point the others missed, keep it; drop anything wrong or "
-            "repeated. Then write the single best final answer — complete, "
-            "accurate, at most 5 short sentences. Output ONLY the final answer.")
+def synthesis_prompt(question: str, entries: list[tuple[str, str, str]]) -> str:
+    parts = "\n\n".join(f"[{model} — {agree}]\n{ans[:500]}"
+                        for model, agree, ans in entries)
+    return (f"Question: {question}\n\n"
+            f"Draft answers from {len(entries)} independent small models:\n\n{parts}\n\n"
+            "Write the final answer to the question. Rules:\n"
+            "- Follow the question's instructions exactly (audience, style, length, "
+            "format). If it asks for simple language, be simple.\n"
+            "- Prefer points the drafts agree on; keep a unique point only if it is "
+            "clearly correct; fix or drop anything wrong.\n"
+            "- Do not mention the drafts or this process.\n\n"
+            "Final answer:")
 
 
 async def node_generate(node: Node, req: dict) -> dict | None:
@@ -197,26 +219,37 @@ async def run_round(question: str, asked_by: str):
         }
 
     # view label per node: nodes sharing a modal probe cluster share a view
-    view_of = {}
-    for nid, m in modal.items():
-        view_of[nid] = m
-    distinct = {m: chr(65 + i) for i, m in enumerate(dict.fromkeys(view_of.values()))}
-    views = {nid: distinct[m] for nid, m in view_of.items()}
+    distinct = {m: chr(65 + i) for i, m in enumerate(dict.fromkeys(modal.values()))}
+    views = {nid: distinct[m] for nid, m in modal.items()}
+    view_counts = Counter(views.values())
     n_views = len(distinct)
     gap = n_views > 1
     for nid in per_node:
         per_node[nid]["view"] = views[nid]
+        per_node[nid]["agrees"] = view_counts[views[nid]] - 1
+        per_node[nid]["capability"] = capability(per_node[nid]["model"])
     await mesh.broadcast({"type": "round", "round": rid, "phase": "analysis",
-                          "per_node": per_node, "n_views": n_views, "gap": gap})
+                          "per_node": per_node, "n_views": n_views, "gap": gap,
+                          "view_counts": dict(view_counts)})
 
-    # ---- synthesis: ONE selected node reads everyone and writes the answer ----
-    selected = min(live, key=lambda nr: (per_node[nr[0].id]["entropy_z"], nr[0].id))[0]
+    # ---- synthesis: the STRONGEST device reads everyone and writes the answer.
+    # "Most self-consistent" turned out to select confident-generic small models
+    # (the §3.2 overconfidence trap, live) — capability caps writing quality, so
+    # the biggest model writes; every draft is in its prompt with agreement marks.
+    selected = max(live, key=lambda nr: (per_node[nr[0].id]["capability"],
+                                         -per_node[nr[0].id]["entropy_z"]))[0]
     synth_tokens = 0
     if gap:
         await mesh.broadcast({"type": "round", "round": rid, "phase": "second_pass",
                               "selected": selected.id, "name": selected.name,
-                              "reason": "most self-consistent node this round"})
-        entries = [(per_node[n.id]["model"], per_node[n.id]["answer"]) for n, _ in live]
+                              "model": selected.model,
+                              "reason": "strongest device in the mesh"})
+        entries = []
+        for n, _ in live:
+            a = per_node[n.id]
+            agree = (f"agrees with {a['agrees']} other device(s)" if a["agrees"]
+                     else "unique view")
+            entries.append((a["model"], agree, a["answer"]))
         r2 = await node_generate(selected, {
             "type": "generate", "req_id": f"{rid}:{selected.id}:second", "round": rid,
             "kind": "second",
@@ -240,6 +273,7 @@ async def run_round(question: str, asked_by: str):
               "final": final, "final_by": {"id": selected.id, "name": selected.name,
                                            "model": selected.model},
               "final_how": final_how, "gap": gap, "n_views": n_views,
+              "view_counts": dict(view_counts),
               "per_node": per_node, "elapsed_s": round(time.time() - t0, 1),
               "total_tokens": total_tokens}
     DATA.mkdir(parents=True, exist_ok=True)
