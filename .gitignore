@@ -1,6 +1,7 @@
-/target
-**/*.rs.bk
-*.swp
 .DS_Store
 .idea/
 .vscode/
+*.swp
+__pycache__/
+*.pyc
+harness/data/
