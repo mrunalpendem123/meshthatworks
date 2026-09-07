@@ -1,10 +1,23 @@
 # mesh-web — join the mesh from any browser
 
 The live testing harness (spec §6.3's browser harness, taken further): every
-phone or laptop opens one URL, loads a small model **in the browser** via WebLLM
-(WebGPU), and becomes a mesh node over WebSocket. This server runs the real
-mechanism from §6.4 — fan-out, semantic clustering, gap detection, one targeted
-second pass to the node with the lowest calibrated entropy, synthesis.
+phone or laptop opens one URL, loads a small model **in the browser**, and
+becomes a mesh node over WebSocket. Two backends, picked automatically:
+
+- **WebLLM (WebGPU)** — fast, on devices with GPU access in the browser
+- **transformers.js (WASM)** — slower, but runs on *any* browser, including
+  phones without WebGPU
+
+Per round the coordinator runs the §6.4 loop, tuned for live open-ended use:
+
+1. every node writes **one proper answer** plus K=3 **short one-line probes**
+   (the probes are the cheap entropy signal — full-length samples were 4× slower)
+2. probes are clustered semantically across nodes → how many distinct views?
+3. on disagreement, the node with the lowest calibrated entropy becomes the
+   round's **synthesizer**: it reads everyone's answers, keeps agreed points and
+   unique correct additions, drops what's wrong, and *writes* the final merged
+   answer — one targeted second inference, never a broadcast
+4. every device sees **the mesh's answer next to what it said alone**
 
 This validates the mechanism and the coordination, not latency or energy —
 those need stages 4–5 (real transports, NPUs, power meters).
@@ -27,16 +40,10 @@ those need stages 4–5 (real transports, NPUs, power meters).
   Open the printed `https://….trycloudflare.com` URL on each phone. Works from
   anywhere, not just your Wi-Fi.
 
-On each device: enter a name, pick a model sized for the device (SmolLM2-360M /
-Qwen-0.5B for phones, 1B–3B for laptops — pick a *different family* per device),
-hit **load model & join mesh** (first load downloads the model into browser
-cache), then ask a question from any device. Short-answer questions show the
-mechanism best.
-
-What you'll see per round: every node's greedy answer + samples, its semantic
-entropy, whether a gap was detected (greedy answers in >1 semantic cluster), which
-node was selected for the one targeted second pass, and the synthesized final
-answer with total token cost.
+On each device: enter a name, accept the suggested model (the page auto-suggests
+a model *family not yet in the mesh* — heterogeneity is where the value comes
+from), hit **load model & join mesh**, then ask from any device. Devices without
+WebGPU automatically get the no-GPU (WASM) model list.
 
 ## Notes
 

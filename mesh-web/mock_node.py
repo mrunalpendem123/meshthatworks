@@ -24,13 +24,13 @@ async def run(name: str, answers: list[str], url: str):
             msg = json.loads(raw)
             if msg.get("type") != "generate":
                 continue
-            greedy = {"text": answers[0], "tokens": 8}
-            samples = [{"text": next(cycle), "tokens": 8}
-                       for _ in range(msg["k_samples"])]
+            answer = {"text": answers[0], "tokens": 14}
+            probes = [{"text": next(cycle), "tokens": 8}
+                      for _ in range(msg["k_probes"])]
             await ws.send(json.dumps({"type": "generation", "req_id": msg["req_id"],
-                                      "greedy": greedy, "samples": samples}))
-            print(f"[{name}] {msg['kind']}: greedy={greedy['text']} "
-                  f"samples={[s['text'] for s in samples]}")
+                                      "answer": answer, "probes": probes}))
+            print(f"[{name}] {msg['kind']}: answer={answer['text']!r} "
+                  f"probes={[p['text'] for p in probes]}")
 
 
 if __name__ == "__main__":

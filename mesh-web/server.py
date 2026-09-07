@@ -1,13 +1,22 @@
 """Web-mesh coordinator (spec §6.4, live over browser nodes).
 
 Every device — phone or laptop — opens the same page, loads a small model in the
-browser via WebLLM (WebGPU), and joins over WebSocket. This process runs the
-mechanism: fan out, cluster, measure the gap, pick ONE node for the targeted
-second pass, synthesize. Rounds are logged to data/rounds.jsonl.
+browser (WebLLM on WebGPU, transformers.js on WASM as fallback), and joins over
+WebSocket. Per round:
 
-  .venv/bin/python mesh-web/server.py            # http://localhost:8020
-  cloudflared tunnel --url http://localhost:8020  # HTTPS URL for phones (WebGPU
-                                                  # needs a secure context)
+  1. every node writes ONE proper answer + K short one-line probes (for entropy)
+  2. probes are clustered semantically across nodes → how many distinct views?
+  3. if views disagree, the node with the lowest calibrated entropy becomes the
+     round's synthesizer: it reads everyone's answers, notes what each adds and
+     what is missing, and WRITES the final merged answer (one targeted second
+     inference — never a broadcast)
+  4. everyone sees the mesh's answer next to what their own device said alone
+
+Rounds are logged to harness/data/rounds.jsonl.
+
+  .venv/bin/python mesh-web/server.py             # http://localhost:8020
+  cloudflared tunnel --url http://localhost:8020  # HTTPS for phones (WebGPU/WASM
+                                                  # both want a secure context)
 """
 
 import asyncio
@@ -15,7 +24,7 @@ import json
 import statistics
 import time
 import uuid
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path
 
 import uvicorn
@@ -27,20 +36,24 @@ from cluster import cluster, extract_answer, semantic_entropy
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT.parent / "harness" / "data"
-K_SAMPLES = 3            # per node per round — phones are slow, keep live K small
-GEN_TIMEOUT = 240        # seconds to wait for a node's generations
-MIN_CALIB_ROUNDS = 5     # rounds of history before z-normalization kicks in
+K_PROBES = 3             # short one-line probes per node (entropy signal)
+ANSWER_MAX_TOKENS = 170
+PROBE_MAX_TOKENS = 32
+SYNTH_MAX_TOKENS = 240
+GEN_TIMEOUT = 300        # WASM phones are slow; stream progress so it feels alive
+MIN_CALIB_ROUNDS = 5
 
 app = FastAPI()
 
 
 class Node:
-    def __init__(self, ws: WebSocket, name: str, model: str, device: str):
+    def __init__(self, ws: WebSocket, name: str, model: str, device: str, backend: str):
         self.ws = ws
         self.id = uuid.uuid4().hex[:8]
         self.name = name
         self.model = model
         self.device = device
+        self.backend = backend
         self.status = "ready"
         self.pending: dict[str, asyncio.Future] = {}
 
@@ -55,13 +68,14 @@ class Mesh:
 
     def roster(self) -> list[dict]:
         return [{"id": n.id, "name": n.name, "model": n.model, "device": n.device,
-                 "status": n.status} for n in self.nodes.values()]
+                 "backend": n.backend, "status": n.status} for n in self.nodes.values()]
 
     async def broadcast(self, msg: dict):
+        data = json.dumps(msg)
         dead = []
         for ws in [n.ws for n in self.nodes.values()] + list(self.viewers):
             try:
-                await ws.send_text(json.dumps(msg))
+                await ws.send_text(data)
             except Exception:
                 dead.append(ws)
         for ws in dead:
@@ -82,16 +96,26 @@ class Mesh:
 mesh = Mesh()
 
 
-def first_pass_prompt(question: str) -> str:
-    return ("Answer as briefly as possible — just the answer itself, one line, "
-            f"no explanation.\n\nQ: {question}\nA:")
+def answer_prompt(question: str) -> str:
+    return ("Answer the question below well, in at most 4 short sentences. "
+            "Be concrete and correct; no filler, no headings.\n\n"
+            f"Question: {question}\nAnswer:")
 
 
-def second_pass_prompt(question: str, candidates: list[str]) -> str:
-    cands = "\n".join(f"- {c}" for c in dict.fromkeys(candidates))
-    return ("Different answerers gave these candidate answers:\n" + cands +
-            "\n\nThink about which is correct (or give a better one), then reply "
-            f"with just the final answer on one line.\n\nQ: {question}\nA:")
+def probe_prompt(question: str) -> str:
+    return ("Answer in ONE short sentence — the single most important point only."
+            f"\n\nQuestion: {question}\nAnswer:")
+
+
+def synthesis_prompt(question: str, entries: list[tuple[str, str]]) -> str:
+    parts = "\n\n".join(f"[{model}]\n{ans[:500]}" for model, ans in entries)
+    return ("You are the synthesizer for a mesh of small AI models. They answered "
+            "this question independently:\n\n"
+            f"Question: {question}\n\n{parts}\n\n"
+            "Compare the answers: where they agree, trust them; where one adds a "
+            "correct point the others missed, keep it; drop anything wrong or "
+            "repeated. Then write the single best final answer — complete, "
+            "accurate, at most 5 short sentences. Output ONLY the final answer.")
 
 
 async def node_generate(node: Node, req: dict) -> dict | None:
@@ -117,101 +141,106 @@ async def run_round(question: str, asked_by: str):
     t0 = time.time()
     await mesh.broadcast({"type": "round", "round": rid, "phase": "fanout",
                           "question": question, "asked_by": asked_by,
-                          "nodes": [n.id for n in nodes], "k": K_SAMPLES})
+                          "nodes": [{"id": n.id, "name": n.name, "model": n.model}
+                                    for n in nodes]})
 
-    # ---- first pass: every node, greedy + K samples, in parallel ----
-    reqs = [node_generate(n, {
-        "type": "generate", "req_id": f"{rid}:{n.id}:first", "round": rid,
-        "kind": "first", "prompt": first_pass_prompt(question),
-        "k_samples": K_SAMPLES, "temperature": 1.0, "max_tokens": 80,
-    }) for n in nodes]
-    results = await asyncio.gather(*reqs)
+    # ---- first pass: 1 proper answer + K one-line probes, streamed as done ----
+    async def first_pass(n: Node):
+        r = await node_generate(n, {
+            "type": "generate", "req_id": f"{rid}:{n.id}:first", "round": rid,
+            "kind": "first",
+            "answer_prompt": answer_prompt(question),
+            "probe_prompt": probe_prompt(question),
+            "k_probes": K_PROBES, "temperature": 1.0,
+            "answer_max_tokens": ANSWER_MAX_TOKENS,
+            "probe_max_tokens": PROBE_MAX_TOKENS,
+        })
+        await mesh.broadcast({"type": "round", "round": rid, "phase": "node_done",
+                              "node": n.id, "name": n.name, "ok": r is not None,
+                              "preview": (r["answer"]["text"][:90] if r else None)})
+        return r
 
-    live: list[tuple[Node, dict]] = []
-    for n, r in zip(nodes, results):
-        if r is None:
-            await mesh.broadcast({"type": "round", "round": rid, "phase": "node_timeout",
-                                  "node": n.id})
-        else:
-            live.append((n, r))
+    results = await asyncio.gather(*[first_pass(n) for n in nodes])
+    live = [(n, r) for n, r in zip(nodes, results) if r]
     if len(live) < 2:
         await mesh.broadcast({"type": "round", "round": rid, "phase": "error",
                               "message": "fewer than 2 nodes answered"})
         return
 
-    # ---- analysis: joint clustering, per-node entropy, gap ----
+    # ---- analysis: cluster probes jointly, entropy per node, distinct views ----
     flat, owner = [], []
     for n, r in live:
-        for s in r["samples"]:
-            flat.append(extract_answer(s["text"]))
-            owner.append(("sample", n.id))
-        flat.append(extract_answer(r["greedy"]["text"]))
-        owner.append(("greedy", n.id))
+        for p in r["probes"]:
+            flat.append(extract_answer(p["text"]))
+            owner.append(n.id)
     joint = await asyncio.to_thread(cluster, question, flat)
-
     per_node_ids = defaultdict(list)
-    greedy_cid, greedy_ans = {}, {}
-    for cid, (kind, nid), ans in zip(joint, owner, flat):
-        if kind == "sample":
-            per_node_ids[nid].append(cid)
-        else:
-            greedy_cid[nid] = cid
-            greedy_ans[nid] = ans
+    for cid, nid in zip(joint, owner):
+        per_node_ids[nid].append(cid)
 
-    analysis = {}
+    modal = {}
+    per_node = {}
     for n, r in live:
-        raw = semantic_entropy(per_node_ids[n.id])
+        ids = per_node_ids[n.id]
+        raw = semantic_entropy(ids)
         z, calibrated = mesh.znorm(n.model, raw)
         mesh.entropy_hist[n.model].append(raw)
-        analysis[n.id] = {
-            "name": n.name, "model": n.model,
-            "greedy_answer": greedy_ans[n.id],
-            "sample_answers": [extract_answer(s["text"]) for s in r["samples"]],
+        pos = [c for c in ids if c >= 0]
+        modal[n.id] = Counter(pos).most_common(1)[0][0] if pos else -abs(hash(n.id)) % 10**6
+        per_node[n.id] = {
+            "name": n.name, "model": n.model, "backend": n.backend,
+            "answer": r["answer"]["text"].strip(),
+            "probes": [extract_answer(p["text"]) for p in r["probes"]],
             "entropy_raw": round(raw, 3), "entropy_z": round(z, 3),
             "calibrated": calibrated,
-            "tokens": r["greedy"]["tokens"] + sum(s["tokens"] for s in r["samples"]),
+            "tokens": r["answer"]["tokens"] + sum(p["tokens"] for p in r["probes"]),
         }
-    n_clusters = len(set(greedy_cid.values()))
-    gap = n_clusters > 1
-    await mesh.broadcast({"type": "round", "round": rid, "phase": "analysis",
-                          "per_node": analysis, "n_greedy_clusters": n_clusters,
-                          "gap": gap})
 
-    # ---- targeted second pass: ONE node, lowest (z-normalized) entropy ----
-    second = None
-    selected_id = None
+    # view label per node: nodes sharing a modal probe cluster share a view
+    view_of = {}
+    for nid, m in modal.items():
+        view_of[nid] = m
+    distinct = {m: chr(65 + i) for i, m in enumerate(dict.fromkeys(view_of.values()))}
+    views = {nid: distinct[m] for nid, m in view_of.items()}
+    n_views = len(distinct)
+    gap = n_views > 1
+    for nid in per_node:
+        per_node[nid]["view"] = views[nid]
+    await mesh.broadcast({"type": "round", "round": rid, "phase": "analysis",
+                          "per_node": per_node, "n_views": n_views, "gap": gap})
+
+    # ---- synthesis: ONE selected node reads everyone and writes the answer ----
+    selected = min(live, key=lambda nr: (per_node[nr[0].id]["entropy_z"], nr[0].id))[0]
+    synth_tokens = 0
     if gap:
-        selected = min(live, key=lambda nr: (analysis[nr[0].id]["entropy_z"], nr[0].id))[0]
-        selected_id = selected.id
-        candidates = [a for a in greedy_ans.values() if a]
         await mesh.broadcast({"type": "round", "round": rid, "phase": "second_pass",
-                              "selected": selected.id,
-                              "reason": "lowest normalized semantic entropy"})
+                              "selected": selected.id, "name": selected.name,
+                              "reason": "most self-consistent node this round"})
+        entries = [(per_node[n.id]["model"], per_node[n.id]["answer"]) for n, _ in live]
         r2 = await node_generate(selected, {
             "type": "generate", "req_id": f"{rid}:{selected.id}:second", "round": rid,
-            "kind": "second", "prompt": second_pass_prompt(question, candidates),
-            "k_samples": 0, "temperature": 0.0, "max_tokens": 120,
+            "kind": "second",
+            "answer_prompt": synthesis_prompt(question, entries),
+            "k_probes": 0, "temperature": 0.0,
+            "answer_max_tokens": SYNTH_MAX_TOKENS, "probe_max_tokens": 0,
         })
         if r2:
-            second = {"node": selected.id, "answer": extract_answer(r2["greedy"]["text"]),
-                      "tokens": r2["greedy"]["tokens"]}
+            final = r2["answer"]["text"].strip()
+            synth_tokens = r2["answer"]["tokens"]
+            final_how = "synthesized"
+        else:
+            final = per_node[selected.id]["answer"]
+            final_how = "selected (synthesis timed out)"
+    else:
+        final = per_node[selected.id]["answer"]
+        final_how = "consensus"
 
-    # ---- synthesis: weighted cluster vote (greedy=1, second pass=2) ----
-    votes = [(greedy_ans[n.id], 1.0) for n, _ in live]
-    if second and second["answer"]:
-        votes.append((second["answer"], 2.0))
-    vote_answers = [v[0] for v in votes]
-    vote_ids = await asyncio.to_thread(cluster, question, vote_answers)
-    weight = defaultdict(float)
-    for (a, w), cid in zip(votes, vote_ids):
-        weight[cid] += w
-    win = max(weight, key=lambda c: weight[c])
-    final = next(a for (a, _), cid in zip(votes, vote_ids) if cid == win and a)
-
-    total_tokens = sum(a["tokens"] for a in analysis.values()) + (second["tokens"] if second else 0)
-    record = {"round": rid, "ts": time.time(), "question": question, "final": final,
-              "gap": gap, "selected": selected_id, "second": second,
-              "per_node": analysis, "elapsed_s": round(time.time() - t0, 1),
+    total_tokens = sum(a["tokens"] for a in per_node.values()) + synth_tokens
+    record = {"round": rid, "ts": time.time(), "question": question,
+              "final": final, "final_by": {"id": selected.id, "name": selected.name,
+                                           "model": selected.model},
+              "final_how": final_how, "gap": gap, "n_views": n_views,
+              "per_node": per_node, "elapsed_s": round(time.time() - t0, 1),
               "total_tokens": total_tokens}
     DATA.mkdir(parents=True, exist_ok=True)
     with open(DATA / "rounds.jsonl", "a") as f:
@@ -241,7 +270,7 @@ async def ws_endpoint(ws: WebSocket):
             if t == "register":
                 mesh.viewers.discard(ws)
                 node = Node(ws, msg.get("name") or "anon", msg["model"],
-                            msg.get("device", "?"))
+                            msg.get("device", "?"), msg.get("backend", "?"))
                 mesh.nodes[node.id] = node
                 await ws.send_text(json.dumps({"type": "registered", "node_id": node.id}))
                 await mesh.broadcast_roster()
@@ -261,8 +290,8 @@ async def ws_endpoint(ws: WebSocket):
                                                    "message": "a round is already running"}))
                     continue
                 asker = node.name if node else "viewer"
-                # Run in a background task: the asker may itself be a node, and its
-                # generation replies arrive on this same receive loop.
+                # background task: the asker may itself be a node, and its
+                # generation replies arrive on this same receive loop
                 asyncio.create_task(locked_round(q, asker))
     except WebSocketDisconnect:
         pass
@@ -299,5 +328,5 @@ if __name__ == "__main__":
         threading.Thread(target=_warm, daemon=True).start()
 
     print("mesh-web coordinator on http://localhost:8020")
-    print("phones need HTTPS for WebGPU → cloudflared tunnel --url http://localhost:8020")
+    print("phones need HTTPS → cloudflared tunnel --url http://localhost:8020")
     uvicorn.run(app, host="0.0.0.0", port=8020, log_level="warning")
